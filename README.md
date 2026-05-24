@@ -4,9 +4,10 @@ Drive the **full Claude Code agent from Telegram** — read, edit and run code i
 your projects from your phone, with persistent per-project sessions so the
 conversation accumulates exactly like a long desktop session.
 
-It is a single ~500-line Python file, **standard library only** (no `pip`
-install), that long-polls Telegram and shells out to the `claude` CLI in
-headless stream-json mode. The same file runs on Windows, Linux and WSL.
+It is a single Python file, **standard library only** (no `pip` install), that
+long-polls Telegram and shells out to the `claude` CLI in headless stream-json
+mode. The same file runs on Windows, Linux and WSL. The only optional extra is
+`stt_faster_whisper.py`, a small helper for fully-local voice transcription.
 
 ---
 
@@ -49,6 +50,26 @@ You accept this risk by running it.
   the agent works.
 - **Tool transparency** — each reply is prefixed with a `🔧` summary of the
   tools the agent used that turn.
+- **Image input** — attach a photo (or an image file) with a caption; the
+  caption becomes the prompt and the agent sees the image via its Read tool.
+  No caption falls back to "Analise esta imagem."
+- **Voice / audio input** — voice messages, audio files and round video notes
+  are transcribed to text and sent to the agent as a prompt; the transcript is
+  echoed back so you can see what was understood. Two backends: a **local**
+  command (`STT_CMD`, e.g. the bundled faster-whisper helper — fully offline,
+  no key) or a **cloud** OpenAI-compatible Whisper endpoint (`STT_API_KEY`,
+  Groq by default). Optional — without either, audio gets a "not configured"
+  notice.
+- **Document input** — send any file (PDF, text, code, spreadsheet…) with a
+  caption; it is downloaded and its path handed to the agent, which reads it
+  with its Read tool (text/PDF) or its other tools. No caption falls back to
+  "Analise este documento."
+- **Restart notification** — on every startup the bridge messages the owner
+  ("Bridge reiniciado — no ar"), so no reboot (manual, crash-restart or logon
+  launch) ever passes silently, even one that killed an in-flight turn. A
+  deliberate restart after a change can leave a one-shot note
+  (`tmp/restart_note.txt`) whose text is appended to that message, so you learn
+  *what* was done; a plain restart just announces the reboot.
 - **Owner-only** — hard allowlist on a single Telegram user id.
 
 ---
@@ -58,6 +79,9 @@ You accept this risk by running it.
 ```
 Telegram getUpdates (long poll)
    └─ owner gate (OWNER_ID)            ← rejects everyone else first
+        ├─ photo / image doc?          ← download to tmp/, caption = prompt
+        ├─ voice / audio / video note? ← download, transcribe → prompt
+        ├─ other document?             ← download to tmp/, path → prompt
         └─ handle(text)
              ├─ /commands              ← cd / pwd / ls / new / resume / model
              └─ run_claude(cwd, text)
@@ -91,6 +115,10 @@ Telegram.
 - [Claude Code](https://claude.com/claude-code) CLI installed and logged in
   (`claude` on PATH, or set `CLAUDE_BIN`).
 - A Telegram bot token and your numeric Telegram user id.
+- *(optional, for local voice transcription)* `pip install faster-whisper` —
+  used by the bundled `stt_faster_whisper.py` helper. This is the only optional
+  third-party dependency; `bridge.py` itself stays stdlib-only and just shells
+  out to the helper.
 
 ## Setup
 
@@ -131,6 +159,9 @@ WorkingDirectory=/path/to/claude-telegram-bridge
 | Command | What it does |
 | --- | --- |
 | *(any text)* | Sent to the agent as a prompt in the current project's session |
+| *(photo + caption)* | Photo is downloaded to `tmp/`; the caption is the prompt and the agent reads the image (no caption → "Analise esta imagem.") |
+| *(voice / audio note)* | Audio is downloaded, transcribed to text (Whisper), echoed back, and sent to the agent as the prompt (needs `STT_CMD` or `STT_API_KEY`) |
+| *(document + caption)* | File is downloaded to `tmp/`; the caption is the prompt and the agent reads the file (no caption → "Analise este documento.") |
 | `/cd <name\|/abs/path>` | Switch project (relative names resolve under `DEFAULT_CWD`); each project keeps its own session |
 | `/pwd` | Show the current directory, model and session id |
 | `/ls` | List project folders under `DEFAULT_CWD` |
@@ -153,6 +184,10 @@ WorkingDirectory=/path/to/claude-telegram-bridge
 | `STATE_PATH` | – | Where session/offset state is persisted |
 | `CLAUDE_TIMEOUT` | – | Max seconds per turn before the agent is killed (default 1800) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | – | Only if `claude` is not already logged in on the host |
+| `STT_CMD` | – | Local transcription command (tried first); audio path appended as last arg, transcript read from stdout. Empty = use cloud |
+| `STT_API_KEY` | – | Cloud Whisper key (fallback when `STT_CMD` empty). Also accepts `GROQ_API_KEY` / `OPENAI_API_KEY` |
+| `STT_API_URL` | – | Cloud transcription endpoint (default Groq; set to OpenAI's to switch) |
+| `STT_MODEL` | – | Cloud transcription model (default `whisper-large-v3`) |
 
 ## State & logs
 
@@ -160,6 +195,9 @@ WorkingDirectory=/path/to/claude-telegram-bridge
   session id map. Gitignored.
 - `bridge.log` — stderr (used when run windowless, where stderr is otherwise
   unavailable). Gitignored.
+- `tmp/` — media downloaded from Telegram (images, audio, documents), kept so
+  the agent can re-read them within the session, plus the one-shot
+  `restart_note.txt`. Gitignored.
 
 ## Notes / gotchas
 

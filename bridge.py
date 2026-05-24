@@ -17,6 +17,7 @@ import html
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -64,11 +65,35 @@ DEFAULT_CWD = CFG.get("DEFAULT_CWD", "/mnt/c/Coding")
 STATE_PATH = CFG.get("STATE_PATH", "/root/telegram-bridge/state.json")
 CLAUDE_TIMEOUT = int(CFG.get("CLAUDE_TIMEOUT", "1800") or "1800")
 
+# Speech-to-text for voice/audio. Two backends, tried in this order:
+#   1) STT_CMD  — a LOCAL command (e.g. faster-whisper) the bridge shells out
+#      to; the audio path is appended as the last arg, transcript read from
+#      stdout. Fully offline, no key, no audio leaves the machine.
+#   2) STT_API_KEY — an OpenAI-compatible /audio/transcriptions endpoint
+#      (Groq by default; OpenAI by swapping URL+model). Cloud fallback.
+# Neither set -> audio messages get a friendly "not configured" notice.
+STT_CMD = CFG.get("STT_CMD", "")
+STT_API_KEY = (CFG.get("STT_API_KEY", "") or CFG.get("GROQ_API_KEY", "")
+               or CFG.get("OPENAI_API_KEY", ""))
+STT_API_URL = CFG.get("STT_API_URL",
+                      "https://api.groq.com/openai/v1/audio/transcriptions")
+STT_MODEL = CFG.get("STT_MODEL", "whisper-large-v3")
+
 API = "https://api.telegram.org/bot%s" % TOKEN
 
 # Stop child claude.exe from flashing a console window when the bridge itself
 # runs windowless (pythonw.exe via the scheduled task). No-op off Windows.
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+# Where downloaded Telegram media (images, later audio) lands. Gitignored;
+# files persist through the session so the agent can re-read them.
+TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
+
+# One-shot note describing the task that triggered a restart. Written before a
+# deliberate restart; read + deleted on the next startup so its description is
+# appended to the "Bridge reiniciado" message exactly once. Absent on a plain
+# (crash / logon) restart, which then just announces the reboot.
+RESTART_NOTE = os.path.join(TMP_DIR, "restart_note.txt")
 
 
 # ----------------------------------------------------------------- state ----
@@ -180,6 +205,98 @@ def typing(chat_id):
         tg("sendChatAction", {"chat_id": chat_id, "action": "typing"})
     except Exception:
         pass
+
+
+def tg_download_file(file_id, dest_dir, name_hint=None):
+    """Resolve a Telegram file_id and download its bytes into dest_dir.
+    Returns the absolute local path, or None on failure. Bot API caps
+    downloads at 20 MB. name_hint (e.g. the original file name) is used only
+    to pick the extension, so the agent's Read tool detects the file type."""
+    try:
+        info = tg("getFile", {"file_id": file_id})
+        fp = (info.get("result") or {}).get("file_path") if info.get("ok") else None
+        if not fp:
+            return None
+        url = "https://api.telegram.org/file/bot%s/%s" % (TOKEN, fp)
+        os.makedirs(dest_dir, exist_ok=True)
+        ext = os.path.splitext(name_hint or fp)[1] or ".bin"
+        dest = os.path.join(dest_dir, "tg_%d%s" % (int(time.time() * 1000), ext))
+        with urllib.request.urlopen(url, timeout=120) as r:
+            data = r.read()
+        with open(dest, "wb") as fh:
+            fh.write(data)
+        return dest
+    except Exception as e:
+        sys.stderr.write("download error: %s\n" % e)
+        return None
+
+
+def transcribe_audio(path):
+    """Transcribe an audio file to text. Prefers the local STT_CMD backend;
+    falls back to the cloud API. Returns the transcript, or None on failure."""
+    if STT_CMD:
+        return _transcribe_local(path)
+    if STT_API_KEY:
+        return _transcribe_cloud(path)
+    return None
+
+
+def _transcribe_local(path):
+    """Run STT_CMD as a subprocess with the audio path appended as the last
+    argument; the transcript is read from stdout. shlex(posix=False) keeps
+    Windows backslashes intact; surrounding quotes are stripped per token."""
+    try:
+        args = [p.strip('"') for p in shlex.split(STT_CMD, posix=False)] + [path]
+        # Forward STT_WHISPER_* tunables from bridge.env (CFG) into the child's
+        # environment — the helper reads them from os.environ, and CFG values
+        # are not otherwise exported.
+        env = dict(os.environ)
+        for k in ("STT_WHISPER_MODEL", "STT_WHISPER_DEVICE",
+                  "STT_WHISPER_COMPUTE", "STT_WHISPER_LANG"):
+            if CFG.get(k):
+                env[k] = CFG[k]
+        proc = subprocess.run(args, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=300,
+                              creationflags=CREATE_NO_WINDOW, env=env)
+        if proc.returncode != 0:
+            sys.stderr.write("stt_cmd rc=%s: %s\n"
+                             % (proc.returncode, (proc.stderr or "")[-800:]))
+            return None
+        return (proc.stdout or "").strip()
+    except Exception as e:
+        sys.stderr.write("stt_cmd error: %s\n" % e)
+        return None
+
+
+def _transcribe_cloud(path):
+    """Upload an audio file to the OpenAI-compatible /audio/transcriptions
+    endpoint (Groq by default) and return the transcript text, or None.
+    Builds the multipart/form-data body by hand to stay stdlib-only."""
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read()
+        boundary = "----bridge%d" % int(time.time() * 1000)
+        bnd = ("--" + boundary).encode()
+        body = bytearray()
+        for name, value in (("model", STT_MODEL), ("response_format", "json")):
+            body += bnd + b"\r\n"
+            body += ('Content-Disposition: form-data; name="%s"\r\n\r\n%s\r\n'
+                     % (name, value)).encode()
+        body += bnd + b"\r\n"
+        body += ('Content-Disposition: form-data; name="file"; filename="%s"\r\n'
+                 "Content-Type: application/octet-stream\r\n\r\n"
+                 % os.path.basename(path)).encode()
+        body += blob + b"\r\n" + bnd + b"--\r\n"
+        req = urllib.request.Request(STT_API_URL, data=bytes(body))
+        req.add_header("Authorization", "Bearer %s" % STT_API_KEY)
+        req.add_header("Content-Type",
+                       "multipart/form-data; boundary=%s" % boundary)
+        with urllib.request.urlopen(req, timeout=180) as r:
+            data = json.load(r)
+        return (data.get("text") or "").strip()
+    except Exception as e:
+        sys.stderr.write("transcribe error: %s\n" % e)
+        return None
 
 
 # ---------------------------------------------------------------- claude ----
@@ -496,6 +613,26 @@ def main():
         sys.exit(1)
     sys.stderr.write("bridge up. owner=%d model=%s cwd=%s\n"
                      % (OWNER_ID, STATE.get("model"), STATE["cwd"]))
+    # Announce every startup to the owner so no reboot (mine, a crash-restart
+    # or a logon launch) ever passes silently — even one that killed the
+    # session before a reply could be sent. If a restart note was left behind
+    # (a deliberate restart after some task), append it once, then clear it.
+    note = ""
+    try:
+        if os.path.exists(RESTART_NOTE):
+            with open(RESTART_NOTE, "r", encoding="utf-8", errors="replace") as fh:
+                note = fh.read().strip()
+            os.remove(RESTART_NOTE)
+    except Exception as e:
+        sys.stderr.write("restart note error: %s\n" % e)
+    msg = ("♻️ *Bridge reiniciado* — no ar de novo.\n🧠 %s · 📁 %s"
+           % (STATE.get("model"), STATE["cwd"]))
+    if note:
+        msg += "\n\n✅ *Antes do reboot:* %s" % note
+    try:
+        send(OWNER_ID, msg)
+    except Exception as e:
+        sys.stderr.write("startup notify error: %s\n" % e)
     while True:
         try:
             resp = tg("getUpdates",
@@ -517,8 +654,64 @@ def main():
             if frm != OWNER_ID:
                 sys.stderr.write("denied uid=%s\n" % frm)
                 continue
+
+            # Photo (largest size) or image document -> download to tmp/ and
+            # hand the agent the file path; its Read tool ingests the image.
+            # Caption becomes the prompt; no caption -> a default instruction.
+            photo = msg.get("photo")
+            doc = msg.get("document")
+            file_id = None
+            if photo:
+                file_id = photo[-1].get("file_id")
+            elif doc and (doc.get("mime_type") or "").startswith("image/"):
+                file_id = doc.get("file_id")
+            if file_id:
+                img_path = tg_download_file(file_id, TMP_DIR)
+                if not img_path:
+                    send(chat_id, "⚠️ não consegui baixar a imagem do Telegram.")
+                    continue
+                instruction = (msg.get("caption") or "").strip() or "Analise esta imagem."
+                text = ("[Imagem recebida via Telegram, salva em: %s]\n\n%s"
+                        % (img_path, instruction))
+
+            # Voice / audio / round-video -> download, transcribe, use as prompt.
+            voice = msg.get("voice") or msg.get("audio") or msg.get("video_note")
+            is_audio_doc = doc and (doc.get("mime_type") or "").startswith("audio/")
+            if not file_id and (voice or is_audio_doc):
+                aud_path = tg_download_file((voice or doc).get("file_id"), TMP_DIR)
+                if not aud_path:
+                    send(chat_id, "⚠️ não consegui baixar o áudio do Telegram.")
+                    continue
+                if not (STT_CMD or STT_API_KEY):
+                    send(chat_id, "🎙️ áudio recebido, mas a transcrição não está "
+                                  "configurada (defina STT_CMD ou STT_API_KEY em "
+                                  "bridge.env).")
+                    continue
+                typing(chat_id)
+                transcript = transcribe_audio(aud_path)
+                if not transcript:
+                    send(chat_id, "⚠️ não consegui transcrever o áudio.")
+                    continue
+                send(chat_id, "🎙️ *transcrição:* %s" % transcript)
+                caption = (msg.get("caption") or "").strip()
+                text = "%s\n\n%s" % (caption, transcript) if caption else transcript
+
+            # Any other document (PDF, text, code, spreadsheet...) -> download
+            # and hand the path to the agent. Its Read tool ingests text/PDF;
+            # for other formats it falls back to its own tools.
+            if not text and doc and not is_audio_doc:
+                doc_path = tg_download_file(doc.get("file_id"), TMP_DIR,
+                                            name_hint=doc.get("file_name"))
+                if not doc_path:
+                    send(chat_id, "⚠️ não consegui baixar o documento do Telegram.")
+                    continue
+                fname = doc.get("file_name") or os.path.basename(doc_path)
+                instruction = (msg.get("caption") or "").strip() or "Analise este documento."
+                text = ("[Documento recebido via Telegram: %s, salvo em: %s]\n\n%s"
+                        % (fname, doc_path, instruction))
+
             if not text:
-                send(chat_id, "(só texto é suportado)")
+                send(chat_id, "(só texto, imagem, áudio e documentos são suportados)")
                 continue
             try:
                 handle(chat_id, text)
