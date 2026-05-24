@@ -209,6 +209,11 @@ WorkingDirectory=/path/to/claude-telegram-bridge
 - **Telegram formatting:** HTML (`parse_mode=HTML`) is used rather than
   MarkdownV2 (which would require escaping too many characters); if a chunk's
   HTML is somehow invalid, `send()` falls back to plain text for that chunk.
+- **PDF analysis:** documents are analysed by the agent's own Read tool, not by
+  the bridge. Text-based PDFs work anywhere, but **scanned / image-only PDFs
+  need `poppler` (`pdftoppm`) installed on the host** so the Read tool can
+  rasterize pages for vision (`scoop install poppler` on Windows,
+  `brew install poppler` on macOS, `apt install poppler-utils` on Linux).
 
 ## License
 
