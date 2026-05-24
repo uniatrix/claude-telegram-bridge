@@ -1,0 +1,18 @@
+# Secrets & runtime state — never commit
+bridge.env
+state.json
+*.log
+
+# Scratch / downloads
+tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
