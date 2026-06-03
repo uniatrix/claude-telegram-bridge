@@ -6,8 +6,9 @@ conversation accumulates exactly like a long desktop session.
 
 It is a single Python file, **standard library only** (no `pip` install), that
 long-polls Telegram and shells out to the `claude` CLI in headless stream-json
-mode. The same file runs on Windows, Linux and WSL. The only optional extra is
-`stt_faster_whisper.py`, a small helper for fully-local voice transcription.
+mode. The same file runs on Windows, macOS, Linux and WSL. The only optional
+extra is `stt_faster_whisper.py`, a small helper for fully-local voice
+transcription.
 
 ---
 
@@ -150,6 +151,46 @@ Start in:  C:\path\to\claude-telegram-bridge
 ExecStart=/usr/bin/python3 /path/to/bridge.py
 Restart=always
 WorkingDirectory=/path/to/claude-telegram-bridge
+```
+
+**macOS (launchd LaunchAgent):** drop the plist below at
+`~/Library/LaunchAgents/com.you.claude-telegram-bridge.plist`, then
+`launchctl load ~/Library/LaunchAgents/com.you.claude-telegram-bridge.plist`
+(runs at login; `KeepAlive` restarts it on crash; `launchctl unload <plist>` to
+stop). launchd does **not** inherit your shell `PATH`, so two things matter:
+set `CLAUDE_BIN` to the absolute path in `bridge.env`
+(e.g. `/Users/you/.local/bin/claude`), and give the plist a `PATH` that includes
+Homebrew so the agent can still find tools like `pdftoppm`.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.you.claude-telegram-bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/you/claude-telegram-bridge/bridge.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/you/claude-telegram-bridge</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/you/claude-telegram-bridge/bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/you/claude-telegram-bridge/bridge.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/you/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
 ```
 
 ---
