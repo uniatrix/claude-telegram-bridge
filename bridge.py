@@ -150,6 +150,7 @@ if STATE["effort"] not in EFFORT_LEVELS:
     STATE["effort"] = EFFORT
 STATE.setdefault("sessions", {})
 STATE.setdefault("resume_page", {})
+STATE.setdefault("mcp_disabled", [])  # user-scope MCP servers turned off
 
 # Process start time, for /status uptime. time.time() is fine here (this is
 # bridge.py, not a workflow script).
@@ -517,6 +518,31 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
     if sid:
         args += ["--resume", sid]
 
+    # MCP toggle: if any user-scope server is turned off, hand claude an
+    # explicit config of ONLY the active ones (--strict-mcp-config so it
+    # ignores the user config). The temp file is chmod 0600 to keep server
+    # tokens out of the argv and is removed after the run.
+    mcp_cfg_path = None
+    disabled = STATE.get("mcp_disabled", [])
+    if disabled:
+        servers = user_mcp_servers()
+        active = {n: c for n, c in servers.items() if n not in disabled}
+        if servers:
+            try:
+                os.makedirs(TMP_DIR, exist_ok=True)
+                mcp_cfg_path = os.path.join(
+                    TMP_DIR, "mcp_%d.json" % int(time.time() * 1000))
+                with open(mcp_cfg_path, "w", encoding="utf-8") as fh:
+                    json.dump({"mcpServers": active}, fh)
+                try:
+                    os.chmod(mcp_cfg_path, 0o600)
+                except OSError:
+                    pass  # best-effort on Windows
+                args += ["--strict-mcp-config", "--mcp-config", mcp_cfg_path]
+            except Exception as e:
+                sys.stderr.write("mcp config error: %s\n" % e)
+                mcp_cfg_path = None
+
     env = dict(os.environ)
     # On Windows claude uses the logged-in credentials file; no token needed.
     if OAUTH:
@@ -594,6 +620,11 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
             err = ""
     finally:
         stop.set()
+        if mcp_cfg_path:
+            try:
+                os.remove(mcp_cfg_path)
+            except OSError:
+                pass
 
     # Killed by /cc -> cancel_report already messaged; hand back a sentinel so
     # handle() stays quiet instead of sending a "sem resultado" notice.
@@ -697,6 +728,7 @@ HELP = (
     "/menu — abre o menu de botões\n"
     "/btw <pergunta> — lookup rápido efêmero (sessão à parte)\n"
     "/cc — cancela a ação em andamento e reporta até onde foi\n"
+    "/mcp — liga/desliga MCP servers user-scope\n"
     "/help — esta ajuda"
 )
 
@@ -714,6 +746,7 @@ BOT_COMMANDS = [
     ("menu", "menu de botões"),
     ("btw", "lookup rápido efêmero (sessão à parte)"),
     ("cc", "cancela a ação em andamento"),
+    ("mcp", "liga/desliga MCP servers"),
     ("help", "esta ajuda"),
 ]
 
@@ -723,7 +756,8 @@ def main_menu_kb():
     return [
         [("📁 Projetos", "ls"), ("↩️ Sessões", "resume")],
         [("🧠 Modelo", "menu:model"), ("⚡ Esforço", "menu:effort")],
-        [("📊 Status", "status"), ("🆕 Nova sessão", "new")],
+        [("🧩 MCP", "mcp"), ("📊 Status", "status")],
+        [("🆕 Nova sessão", "new")],
     ]
 
 
@@ -773,6 +807,25 @@ def handle_callback(cb):
             save_state()
         answer_cb(cb_id, "esforço: %s" % sel)
         return edit_kb(chat_id, mid, "⚡ *Esforço* → %s" % sel, effort_kb())
+    elif data == "mcp":
+        answer_cb(cb_id)
+        return edit_kb(chat_id, mid, mcp_menu_text(), mcp_menu_kb())
+    elif data.startswith("mcpx:"):
+        name = data.split(":", 1)[1]
+        with STATE_LOCK:
+            dis = STATE.setdefault("mcp_disabled", [])
+            if name in dis:
+                dis.remove(name)
+                toast = "🟢 %s ligado" % name
+            else:
+                dis.append(name)
+                toast = "🔴 %s desligado" % name
+            save_state()
+        answer_cb(cb_id, toast)
+        return edit_kb(chat_id, mid, mcp_menu_text(), mcp_menu_kb())
+    elif data == "mcpinfo":
+        return answer_cb(cb_id, "Desligar tira o server deste e dos próximos "
+                         "turns, até religar aqui.")
     elif data in ("status", "new", "ls", "resume"):
         answer_cb(cb_id)
         return handle(chat_id, "/" + data)
@@ -828,6 +881,39 @@ def mcp_servers():
     except Exception as e:
         sys.stderr.write("mcp_servers error: %s\n" % e)
         return "(n/d)"
+
+
+def user_mcp_servers():
+    """{name: config} of user-scope MCP servers from ~/.claude.json. Never
+    raises; returns {} if the file is absent or unreadable."""
+    try:
+        p = os.path.join(os.path.expanduser("~"), ".claude.json")
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data.get("mcpServers", {}) or {}
+    except Exception:
+        return {}
+
+
+def mcp_menu_text():
+    servers = user_mcp_servers()
+    if not servers:
+        return "🧩 nenhum MCP server user-scope em ~/.claude.json."
+    dis = STATE.get("mcp_disabled", [])
+    lines = ["🧩 *MCP servers* — toque pra ligar/desligar"]
+    for n in sorted(servers):
+        lines.append("%s %s" % ("🟢" if n not in dis else "🔴", n))
+    lines.append("\n_Desligado continua desligado até religar._")
+    return "\n".join(lines)
+
+
+def mcp_menu_kb():
+    servers = user_mcp_servers()
+    dis = STATE.get("mcp_disabled", [])
+    rows = [[(("🟢 " if n not in dis else "🔴 ") + n, "mcpx:" + n)]
+            for n in sorted(servers)]
+    rows.append([("ℹ️ info", "mcpinfo")])
+    return rows
 
 
 def _tools_summary(tools):
@@ -953,6 +1039,8 @@ def handle(chat_id, text):
             return cancel_active(chat_id)
         if cmd == "/menu":
             return send_kb(chat_id, "📋 *Menu*", main_menu_kb())
+        if cmd == "/mcp":
+            return send_kb(chat_id, mcp_menu_text(), mcp_menu_kb())
         if cmd == "/btw":
             q = arg.strip()
             if not q:

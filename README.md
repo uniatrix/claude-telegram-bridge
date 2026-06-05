@@ -218,7 +218,12 @@ Homebrew so the agent can still find tools like `pdftoppm`.
 | `/menu` | Open the inline-button menu (model / effort / status / projects / sessions) |
 | `/btw <question>` | Quick one-shot lookup in a **separate** ephemeral session (fast model, never touches the project session — runs concurrently with the main task) |
 | `/cc` (`/cancel`, `/stop`) | Cancel the in-flight run and report how far it got (tools used, elapsed) |
+| `/mcp` | Toggle user-scope MCP servers on/off (🟢/🔴); off stays off until re-enabled |
 | `/help` | Show help |
+
+When any MCP server is toggled off, the bridge hands `claude` a temporary
+`--mcp-config` (0600, `--strict-mcp-config`) listing only the active servers and
+deletes it after the run — keeping server tokens out of the process argv.
 
 A prompt acquires a **non-blocking per-project lock**: if a run is already
 active in that directory, the bridge replies "busy — use `/cc`" instead of
