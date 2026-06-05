@@ -97,6 +97,11 @@ DEFAULT_CWD = CFG.get("DEFAULT_CWD", "/mnt/c/Coding")
 GROUP_DIRS = [g.strip().lower()
               for g in CFG.get("GROUP_DIRS", "Projetos Mac Antigo").split(",")
               if g.strip()]
+# Pinned folders OUTSIDE DEFAULT_CWD, surfaced as one-tap shortcuts in /menu
+# (the /ls browser only walks DEFAULT_CWD, so these would be unreachable there).
+# Comma-separated absolute paths; only the ones that exist are shown.
+SHORTCUT_DIRS = [p.strip() for p in CFG.get("SHORTCUT_DIRS", r"C:\Studies").split(",")
+                 if p.strip()]
 STATE_PATH = CFG.get("STATE_PATH", "/root/telegram-bridge/state.json")
 CLAUDE_TIMEOUT = int(CFG.get("CLAUDE_TIMEOUT", "1800") or "1800")
 
@@ -953,13 +958,24 @@ BOT_COMMANDS = [
 
 
 # --- menu keyboards (navigated in place via edit_kb) ------------------------
+def pinned_dirs():
+    """SHORTCUT_DIRS entries that currently exist, in declared order."""
+    return [p for p in SHORTCUT_DIRS if os.path.isdir(p)]
+
+
 def main_menu_kb():
-    return [
+    rows = [
         [("📁 Projetos", "ls"), ("↩️ Sessões", "resume")],
         [("🧠 Modelo", "menu:model"), ("⚡ Esforço", "menu:effort")],
         [("🧩 MCP", "mcp"), ("📊 Status", "status")],
-        [("🆕 Nova sessão", "new")],
     ]
+    # One-tap shortcuts to pinned folders outside DEFAULT_CWD, 2 per row.
+    pins = [("📚 %s" % os.path.basename(os.path.normpath(p)), "pin:%d" % i)
+            for i, p in enumerate(pinned_dirs())]
+    for k in range(0, len(pins), 2):
+        rows.append(pins[k:k + 2])
+    rows.append([("🆕 Nova sessão", "new")])
+    return rows
 
 
 def model_kb():
@@ -978,6 +994,18 @@ def effort_kb():
             for e in EFFORT_LEVELS]
     rows.append([("‹ voltar", "menu:main")])
     return rows
+
+
+def enter_cwd(chat_id, mid, path):
+    """Point cwd at path, then either open the session chooser (when it has
+    history) or confirm a fresh session. Shared by the /ls cd: taps and the
+    pinned-folder shortcuts."""
+    STATE["cwd"] = path
+    save_state()
+    if list_sessions(path):  # has history -> let the user pick a session
+        return edit_kb(chat_id, mid, "📁 %s\nescolha a sessão:" % path,
+                       session_choice_kb(path))
+    return edit_kb(chat_id, mid, "📁 cwd → %s (sessão nova)" % path, [])
 
 
 def handle_callback(cb):
@@ -1050,13 +1078,16 @@ def handle_callback(cb):
         if not (0 <= idx < len(ordered)):
             return answer_cb(cb_id, "índice inválido")
         path = os.path.join(STATE["ls_base"], ordered[idx])
-        STATE["cwd"] = path
-        save_state()
         answer_cb(cb_id, ordered[idx])
-        if list_sessions(path):  # has history -> let the user pick a session
-            return edit_kb(chat_id, mid, "📁 %s\nescolha a sessão:" % path,
-                           session_choice_kb(path))
-        return edit_kb(chat_id, mid, "📁 cwd → %s (sessão nova)" % path, [])
+        return enter_cwd(chat_id, mid, path)
+    elif data.startswith("pin:"):  # one-tap shortcut to a pinned folder
+        pins = pinned_dirs()
+        idx = int(data.split(":", 1)[1])
+        if not (0 <= idx < len(pins)):
+            return answer_cb(cb_id, "atalho inválido")
+        path = pins[idx]
+        answer_cb(cb_id, os.path.basename(os.path.normpath(path)))
+        return enter_cwd(chat_id, mid, path)
     elif data == "sxnew":  # fresh session in the current cwd
         with STATE_LOCK:
             STATE["sessions"].pop(STATE["cwd"], None)
