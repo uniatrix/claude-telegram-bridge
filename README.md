@@ -217,7 +217,12 @@ Homebrew so the agent can still find tools like `pdftoppm`.
 | `/status` | Uptime, cwd, model, effort, session id, active MCP servers |
 | `/menu` | Open the inline-button menu (model / effort / status / projects / sessions) |
 | `/btw <question>` | Quick one-shot lookup in a **separate** ephemeral session (fast model, never touches the project session — runs concurrently with the main task) |
+| `/cc` (`/cancel`, `/stop`) | Cancel the in-flight run and report how far it got (tools used, elapsed) |
 | `/help` | Show help |
+
+A prompt acquires a **non-blocking per-project lock**: if a run is already
+active in that directory, the bridge replies "busy — use `/cc`" instead of
+queueing, so one stuck turn can't block later messages.
 
 Each message and each button tap is handled on its own daemon thread, so a
 long-running turn never blocks the poll loop — `/btw` and the menu stay

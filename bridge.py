@@ -152,6 +152,29 @@ STATE.setdefault("resume_page", {})
 # bridge.py, not a workflow script).
 START_TIME = time.time()
 
+# Registry of in-flight claude runs, keyed by cwd. Each record holds the live
+# subprocess, the running tool list and the start time, so /cc can kill a run
+# AND report how far it got. Acts as a non-blocking per-project lock: a second
+# prompt for a cwd already running is refused (use /cc) rather than queued, so
+# one stuck turn can't block later messages.
+ACTIVE = {}
+ACTIVE_LOCK = threading.Lock()
+
+
+def cwd_lock(cwd, rec):
+    """Non-blocking. Register rec as the active run for cwd; return True if
+    acquired, False if a run is already active there."""
+    with ACTIVE_LOCK:
+        if cwd in ACTIVE:
+            return False
+        ACTIVE[cwd] = rec
+        return True
+
+
+def cwd_unlock(cwd):
+    with ACTIVE_LOCK:
+        ACTIVE.pop(cwd, None)
+
 
 def save_state():
     with STATE_LOCK:
@@ -448,7 +471,10 @@ def _transcribe_cloud(path):
 
 
 # ---------------------------------------------------------------- claude ----
-def run_claude(chat_id, cwd, prompt, _retry=False):
+def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
+    if rec is None:
+        rec = {"tools": [], "t_start": time.time(), "proc": None,
+               "cancelled": False}
     sid = STATE["sessions"].get(cwd)
     args = [CLAUDE_BIN, "-p", prompt,
             "--model", STATE.get("model", MODEL),
@@ -485,7 +511,7 @@ def run_claude(chat_id, cwd, prompt, _retry=False):
 
     threading.Thread(target=keepalive, daemon=True).start()
 
-    tools, result_text, new_sid, is_error, err = [], None, None, False, ""
+    tools, result_text, new_sid, is_error, err = rec["tools"], None, None, False, ""
     try:
         proc = subprocess.Popen(args, cwd=cwd, env=env,
                                 stdin=subprocess.DEVNULL,
@@ -494,6 +520,7 @@ def run_claude(chat_id, cwd, prompt, _retry=False):
                                 text=True, encoding="utf-8",
                                 errors="replace", bufsize=1,
                                 creationflags=CREATE_NO_WINDOW)
+        rec["proc"] = proc  # so /cc can kill this run
 
         def reader():
             nonlocal result_text, new_sid, is_error
@@ -534,11 +561,16 @@ def run_claude(chat_id, cwd, prompt, _retry=False):
     finally:
         stop.set()
 
+    # Killed by /cc -> cancel_report already messaged; hand back a sentinel so
+    # handle() stays quiet instead of sending a "sem resultado" notice.
+    if rec.get("cancelled"):
+        return tools, None
+
     # Stale session id -> drop it and retry once from scratch.
     if is_error and sid and not _retry and "session" in (result_text or "").lower():
         STATE["sessions"].pop(cwd, None)
         save_state()
-        return run_claude(chat_id, cwd, prompt, _retry=True)
+        return run_claude(chat_id, cwd, prompt, _retry=True, rec=rec)
 
     if new_sid:
         STATE["sessions"][cwd] = new_sid
@@ -618,6 +650,7 @@ HELP = (
     "/status — uptime, dir, modelo, esforço, MCP servers\n"
     "/menu — abre o menu de botões\n"
     "/btw <pergunta> — lookup rápido efêmero (sessão à parte)\n"
+    "/cc — cancela a ação em andamento e reporta até onde foi\n"
     "/help — esta ajuda"
 )
 
@@ -634,6 +667,7 @@ BOT_COMMANDS = [
     ("status", "uptime, dir, modelo, esforço, MCP"),
     ("menu", "menu de botões"),
     ("btw", "lookup rápido efêmero (sessão à parte)"),
+    ("cc", "cancela a ação em andamento"),
     ("help", "esta ajuda"),
 ]
 
@@ -750,6 +784,37 @@ def mcp_servers():
         return "(n/d)"
 
 
+def _tools_summary(tools):
+    if not tools:
+        return "nenhuma"
+    c = Counter(tools)
+    return ", ".join("%s×%d" % (k, v) if v > 1 else k for k, v in c.items())
+
+
+def cancel_report(chat_id, cwd, rec):
+    """Kill an in-flight run and report how far it got (tools used, elapsed)."""
+    rec["cancelled"] = True
+    proc = rec.get("proc")
+    if proc:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    elapsed = fmt_uptime(time.time() - rec.get("t_start", time.time()))
+    send(chat_id, "🛑 cancelado em %s\n🔧 %s\n📁 %s"
+         % (elapsed, _tools_summary(rec.get("tools")), cwd))
+
+
+def cancel_active(chat_id):
+    """Cancel every in-flight run (there's usually at most one per cwd)."""
+    with ACTIVE_LOCK:
+        recs = list(ACTIVE.items())
+    if not recs:
+        return send(chat_id, "✋ nada rodando agora.")
+    for cwd, rec in recs:
+        cancel_report(chat_id, cwd, rec)
+
+
 def resolve_cwd(arg):
     arg = arg.strip().strip('"').strip("'")
     if not arg:
@@ -838,6 +903,8 @@ def handle(chat_id, text):
         arg = parts[1] if len(parts) > 1 else ""
         if cmd in ("/help", "/start"):
             return send(chat_id, HELP)
+        if cmd in ("/cc", "/cancel", "/stop"):
+            return cancel_active(chat_id)
         if cmd == "/menu":
             return send_kb(chat_id, "📋 *Menu*", main_menu_kb())
         if cmd == "/btw":
@@ -964,12 +1031,22 @@ def handle(chat_id, text):
                            sid or "(nova)", mcp_servers()))
         # unknown slash command -> fall through and treat as a prompt
 
-    tools, out = run_claude(chat_id, STATE["cwd"], text)
+    cwd = STATE["cwd"]
+    rec = {"tools": [], "t_start": time.time(), "proc": None, "cancelled": False}
+    # Non-blocking project lock: if a run is already active in this cwd, refuse
+    # rather than queue, so one stuck turn can't block later messages.
+    if not cwd_lock(cwd, rec):
+        return send(chat_id, "⏳ já tem uma ação rodando nesse projeto — /cc "
+                    "pra cancelar.")
+    try:
+        tools, out = run_claude(chat_id, cwd, text, rec=rec)
+    finally:
+        cwd_unlock(cwd)
+    if rec.get("cancelled"):
+        return  # cancel_report already messaged
     prefix = ""
     if tools:
-        c = Counter(tools)
-        summ = ", ".join("%s×%d" % (k, v) if v > 1 else k for k, v in c.items())
-        prefix = "🔧 " + summ + "\n\n"
+        prefix = "🔧 " + _tools_summary(tools) + "\n\n"
     send(chat_id, prefix + (out or ""))
 
 
