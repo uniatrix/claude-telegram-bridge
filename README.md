@@ -213,7 +213,12 @@ Homebrew so the agent can still find tools like `pdftoppm`.
 | `/resume <n>` | Resume session number `n` from the list |
 | `/resume mais` / `/resume menos` | Next / previous page of sessions |
 | `/model <opus\|sonnet\|haiku>` | Switch model |
+| `/effort <low\|medium\|high\|xhigh\|max>` | Set reasoning effort (passed to `claude --effort`) |
+| `/status` | Uptime, cwd, model, effort, session id, active MCP servers |
 | `/help` | Show help |
+
+The slash-command menu is registered with Telegram at startup
+(`setMyCommands`), so the ≡ menu and `/` autocomplete stay in sync.
 
 ## Configuration (`bridge.env`)
 
@@ -223,6 +228,7 @@ Homebrew so the agent can still find tools like `pdftoppm`.
 | `OWNER_ID` | ✅ | Your numeric Telegram user id (the only allowed sender) |
 | `CLAUDE_BIN` | – | Path to the `claude` binary (default: `claude` on PATH) |
 | `CLAUDE_MODEL` | – | `opus` / `sonnet` / `haiku` (default `opus`) |
+| `CLAUDE_EFFORT` | – | `low` / `medium` / `high` / `xhigh` / `max` reasoning effort (default `high`) |
 | `DEFAULT_CWD` | – | Starting directory; parent of your projects |
 | `STATE_PATH` | – | Where session/offset state is persisted |
 | `CLAUDE_TIMEOUT` | – | Max seconds per turn before the agent is killed (default 1800) |

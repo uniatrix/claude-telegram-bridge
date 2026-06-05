@@ -81,6 +81,12 @@ OWNER_ID = int(CFG.get("OWNER_ID", "0") or "0")
 OAUTH = CFG.get("CLAUDE_CODE_OAUTH_TOKEN", "")
 CLAUDE_BIN = CFG.get("CLAUDE_BIN", "/root/.local/bin/claude")
 MODEL = CFG.get("CLAUDE_MODEL", "opus")
+# Reasoning effort passed to claude as --effort. Persisted in STATE, changed at
+# runtime with /effort. Ordered low -> max for the menu and validation.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+EFFORT = CFG.get("CLAUDE_EFFORT", "high")
+if EFFORT not in EFFORT_LEVELS:
+    EFFORT = "high"
 DEFAULT_CWD = CFG.get("DEFAULT_CWD", "/mnt/c/Coding")
 STATE_PATH = CFG.get("STATE_PATH", "/root/telegram-bridge/state.json")
 CLAUDE_TIMEOUT = int(CFG.get("CLAUDE_TIMEOUT", "1800") or "1800")
@@ -133,8 +139,15 @@ STATE = load_state()
 STATE.setdefault("offset", 0)
 STATE.setdefault("cwd", DEFAULT_CWD)
 STATE.setdefault("model", MODEL)
+STATE.setdefault("effort", EFFORT)
+if STATE["effort"] not in EFFORT_LEVELS:
+    STATE["effort"] = EFFORT
 STATE.setdefault("sessions", {})
 STATE.setdefault("resume_page", {})
+
+# Process start time, for /status uptime. time.time() is fine here (this is
+# bridge.py, not a workflow script).
+START_TIME = time.time()
 
 
 def save_state():
@@ -392,6 +405,7 @@ def run_claude(chat_id, cwd, prompt, _retry=False):
     sid = STATE["sessions"].get(cwd)
     args = [CLAUDE_BIN, "-p", prompt,
             "--model", STATE.get("model", MODEL),
+            "--effort", STATE.get("effort", EFFORT),
             "--permission-mode", "bypassPermissions",
             "--output-format", "stream-json", "--verbose"]
     if sid:
@@ -502,8 +516,75 @@ HELP = (
     "/resume [nº|id] — lista sessões; /resume mais|menos pagina; "
     "retoma pelo nº/id\n"
     "/model <opus|sonnet|haiku> — troca o modelo\n"
+    "/effort <low|medium|high|xhigh|max> — esforço de raciocínio\n"
+    "/status — uptime, dir, modelo, esforço, MCP servers\n"
     "/help — esta ajuda"
 )
+
+# Slash-command menu registered with Telegram once at startup (the ≡ button and
+# the "/" autocomplete). Keep in sync with HELP and the handlers below.
+BOT_COMMANDS = [
+    ("cd", "troca o diretório (e a sessão)"),
+    ("pwd", "diretório/sessão atual"),
+    ("ls", "lista projetos em DEFAULT_CWD"),
+    ("new", "sessão nova no dir atual"),
+    ("resume", "lista/retoma sessões"),
+    ("model", "troca o modelo (opus|sonnet|haiku)"),
+    ("effort", "esforço (low|medium|high|xhigh|max)"),
+    ("status", "uptime, dir, modelo, esforço, MCP"),
+    ("help", "esta ajuda"),
+]
+
+
+def set_commands():
+    """Register the slash-command menu with Telegram (setMyCommands). Called
+    once at startup so the ≡ menu and '/' autocomplete stay in sync."""
+    try:
+        cmds = json.dumps([{"command": c, "description": d}
+                           for c, d in BOT_COMMANDS])
+        tg("setMyCommands", {"commands": cmds})
+    except Exception as e:
+        sys.stderr.write("set_commands error: %s\n" % e)
+
+
+def fmt_uptime(seconds):
+    s = int(seconds)
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    parts = []
+    if d:
+        parts.append("%dd" % d)
+    if h or d:
+        parts.append("%dh" % h)
+    if m or h or d:
+        parts.append("%dm" % m)
+    parts.append("%ds" % s)
+    return " ".join(parts)
+
+
+def mcp_servers():
+    """Best-effort list of configured MCP server names via `claude mcp list`.
+    Returns a short string; never raises. Empty/failed -> a friendly marker."""
+    try:
+        env = dict(os.environ)
+        if OAUTH:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = OAUTH
+        proc = subprocess.run([CLAUDE_BIN, "mcp", "list"],
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=20, env=env,
+                              creationflags=CREATE_NO_WINDOW)
+        names = []
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            # Lines look like "name: command ... - ✓ Connected"; take the name.
+            m = re.match(r"^([A-Za-z0-9_.-]+):\s", line)
+            if m:
+                names.append(m.group(1))
+        return ", ".join(names) if names else "(nenhum)"
+    except Exception as e:
+        sys.stderr.write("mcp_servers error: %s\n" % e)
+        return "(n/d)"
 
 
 def resolve_cwd(arg):
@@ -597,8 +678,10 @@ def handle(chat_id, text):
         if cmd == "/pwd":
             cwd = STATE["cwd"]
             sid = STATE["sessions"].get(cwd)
-            return send(chat_id, "📁 %s\n🧠 modelo: %s\n🔗 sessão: %s"
-                        % (cwd, STATE.get("model"), sid or "(nova)"))
+            return send(chat_id, "📁 %s\n🧠 modelo: %s\n⚡ esforço: %s\n"
+                        "🔗 sessão: %s"
+                        % (cwd, STATE.get("model"), STATE.get("effort"),
+                           sid or "(nova)"))
         if cmd == "/ls":
             try:
                 items = sorted(d for d in os.listdir(DEFAULT_CWD)
@@ -684,6 +767,29 @@ def handle(chat_id, text):
             STATE["model"] = m
             save_state()
             return send(chat_id, "🧠 modelo → %s" % m)
+        if cmd == "/effort":
+            e = arg.strip().lower()
+            if e not in EFFORT_LEVELS:
+                return send(chat_id, "use: /effort %s (atual: %s)"
+                            % ("|".join(EFFORT_LEVELS), STATE.get("effort")))
+            STATE["effort"] = e
+            save_state()
+            return send(chat_id, "⚡ esforço → %s" % e)
+        if cmd == "/status":
+            cwd = STATE["cwd"]
+            sid = STATE["sessions"].get(cwd)
+            typing(chat_id)  # mcp_servers() shells out; show activity meanwhile
+            return send(chat_id,
+                        "📊 *Status*\n"
+                        "⏱️ uptime: %s\n"
+                        "📁 cwd: %s\n"
+                        "🧠 modelo: %s\n"
+                        "⚡ esforço: %s\n"
+                        "🔗 sessão: %s\n"
+                        "🧩 MCP: %s"
+                        % (fmt_uptime(time.time() - START_TIME), cwd,
+                           STATE.get("model"), STATE.get("effort"),
+                           sid or "(nova)", mcp_servers()))
         # unknown slash command -> fall through and treat as a prompt
 
     tools, out = run_claude(chat_id, STATE["cwd"], text)
@@ -706,6 +812,7 @@ def main():
         sys.exit(1)
     sys.stderr.write("bridge up. owner=%d model=%s cwd=%s\n"
                      % (OWNER_ID, STATE.get("model"), STATE["cwd"]))
+    set_commands()  # register the ≡ menu / "/" autocomplete once
     # Announce every startup to the owner so no reboot (mine, a crash-restart
     # or a logon launch) ever passes silently — even one that killed the
     # session before a reply could be sent. If a restart note was left behind
