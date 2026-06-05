@@ -1403,10 +1403,39 @@ def global_sessions(cur_cwd):
     return mine, others
 
 
-def _sess_btn_label(mt, path, sid, prefix=""):
-    when = time.strftime("%d/%m %H:%M", time.localtime(mt))
-    prev = session_preview(path, maxlen=28) or sid[:8]
-    return ("%s%s · %s" % (prefix, when, prev))[:60]
+def session_title(path):
+    """Claude Code's generated one-line recap of a session (aiTitle event), or
+    None. Much more descriptive than the first user line."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i > 200:
+                    break
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get("aiTitle"):
+                    return str(ev["aiTitle"]).strip()
+    except Exception:
+        pass
+    return None
+
+
+def session_recap(path, maxlen=44):
+    """Short human recap for the picker: prefer the aiTitle, fall back to the
+    first real user line, then the short id."""
+    t = session_title(path) or session_preview(path, maxlen=maxlen)
+    return (t or "").strip().replace("\n", " ")[:maxlen]
+
+
+def _sess_btn_label(mt, path, sid, tag=None):
+    """Recap-first label. tag (a project name) is appended for other-project
+    rows; current-project rows show the time instead."""
+    recap = session_recap(path) or sid[:8]
+    suffix = ("📁 %s" % tag) if tag else time.strftime("%d/%m %H:%M",
+                                                       time.localtime(mt))
+    return ("%s · %s" % (recap, suffix))[:62]
 
 
 def global_sessions_kb():
@@ -1421,10 +1450,10 @@ def global_sessions_kb():
         rows.append([(mark + _sess_btn_label(mt, p, s), "gsx:" + s)])
     for s, mt, p, cwd in others:
         proj = os.path.basename(os.path.normpath(cwd or "?")) or "?"
-        rows.append([(_sess_btn_label(mt, p, s, prefix="📁 %s · " % proj),
-                      "gsx:" + s)])
-    head = ("🗂️ *Sessões*\n📂 atual: %s\n"
-            "as de baixo pulam direto pro projeto delas." % cur)
+        rows.append([(_sess_btn_label(mt, p, s, tag=proj), "gsx:" + s)])
+    head = ("🗂️ *Sessões* — toque pra retomar\n"
+            "📂 atuais (%s) primeiro, depois outros projetos."
+            % (os.path.basename(os.path.normpath(cur)) or cur))
     if not rows:
         head = "🗂️ Nenhuma sessão encontrada ainda."
     return head, rows
