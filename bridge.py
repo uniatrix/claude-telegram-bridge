@@ -90,17 +90,19 @@ if EFFORT not in EFFORT_LEVELS:
 # Fast model for /btw one-shot lookups (no --resume, never touches a project
 # session, so it can run concurrently with the main task).
 QUICK_MODEL = CFG.get("QUICK_MODEL", "sonnet")
-DEFAULT_CWD = CFG.get("DEFAULT_CWD", "/mnt/c/Coding")
+# Defaults are intentionally generic so a fresh clone leaks no personal paths;
+# real values live in the gitignored bridge.env.
+DEFAULT_CWD = CFG.get("DEFAULT_CWD", os.path.expanduser("~"))
 # Folders under DEFAULT_CWD that are *groups* of secondary projects rather than
 # projects themselves: in the /ls browser they open into their own subfolders
-# instead of becoming the cwd. Comma-separated, case-insensitive.
+# instead of becoming the cwd. Comma-separated, case-insensitive. Empty default.
 GROUP_DIRS = [g.strip().lower()
-              for g in CFG.get("GROUP_DIRS", "Projetos Mac Antigo").split(",")
+              for g in CFG.get("GROUP_DIRS", "").split(",")
               if g.strip()]
 # Pinned folders OUTSIDE DEFAULT_CWD, surfaced as one-tap shortcuts in /menu
 # (the /ls browser only walks DEFAULT_CWD, so these would be unreachable there).
-# Comma-separated absolute paths; only the ones that exist are shown.
-SHORTCUT_DIRS = [p.strip() for p in CFG.get("SHORTCUT_DIRS", r"C:\Studies").split(",")
+# Comma-separated absolute paths; only the ones that exist are shown. Empty default.
+SHORTCUT_DIRS = [p.strip() for p in CFG.get("SHORTCUT_DIRS", "").split(",")
                  if p.strip()]
 STATE_PATH = CFG.get("STATE_PATH", "/root/telegram-bridge/state.json")
 CLAUDE_TIMEOUT = int(CFG.get("CLAUDE_TIMEOUT", "1800") or "1800")
@@ -1106,9 +1108,27 @@ def handle_callback(cb):
     elif data == "new":  # reset to home + clear chat (pass the menu msg id)
         answer_cb(cb_id)
         return handle(chat_id, "/new", msg_id=mid)
-    elif data in ("status", "resume"):
+    elif data == "resume":  # global session browser (current project + others)
         answer_cb(cb_id)
-        return handle(chat_id, "/" + data)
+        head, kb = global_sessions_kb()
+        return edit_kb(chat_id, mid, head, kb)
+    elif data.startswith("gsx:"):  # jump to a session's project AND resume it
+        sid = data.split(":", 1)[1]
+        loc = find_session_file(sid)
+        if not loc or not loc[1]:
+            return answer_cb(cb_id, "sessão não encontrada")
+        path, cwd = loc
+        with STATE_LOCK:
+            STATE["cwd"] = cwd
+            STATE["sessions"][cwd] = sid
+            save_state()
+        answer_cb(cb_id, "→ %s" % (os.path.basename(os.path.normpath(cwd)) or cwd))
+        return edit_kb(chat_id, mid, "↩️ retomando em %s\n🔗 sessão %s\n"
+                       "a próxima mensagem continua essa conversa."
+                       % (cwd, sid[:8]), [])
+    elif data == "status":
+        answer_cb(cb_id)
+        return handle(chat_id, "/status")
     answer_cb(cb_id)
 
 
@@ -1304,6 +1324,110 @@ def find_session(cwd, sid):
         if s == sid or s.startswith(sid):
             return s
     return None
+
+
+# --- global session browser (sessions across ALL projects) ------------------
+GLOBAL_MINE = 6     # current-project sessions shown at the top of /sessions
+GLOBAL_OTHER = 8    # other-project sessions shown below, by recency
+
+
+def _projects_base():
+    return os.path.join(os.path.expanduser("~"), ".claude", "projects")
+
+
+def session_cwd(path):
+    """The real cwd a transcript ran in, read from its events (the slug dir name
+    is lossy, the embedded cwd is authoritative). None if not found."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i > 40:
+                    break
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                c = ev.get("cwd")
+                if c:
+                    return c
+    except Exception:
+        pass
+    return None
+
+
+def find_session_file(sid):
+    """Locate <sid>.jsonl across every project dir -> (path, cwd) or None."""
+    base = _projects_base()
+    try:
+        slugs = os.listdir(base)
+    except Exception:
+        return None
+    for slug in slugs:
+        p = os.path.join(base, slug, sid + ".jsonl")
+        if os.path.isfile(p):
+            return p, session_cwd(p)
+    return None
+
+
+def global_sessions(cur_cwd):
+    """(mine, others): mine = recent sessions of cur_cwd as [(sid, mt, path)];
+    others = most-recent sessions from OTHER projects as [(sid, mt, path, cwd)]."""
+    mine = list_sessions(cur_cwd, limit=GLOBAL_MINE)
+    base = _projects_base()
+    cur_dir = os.path.normpath(project_dir_for(cur_cwd))
+    pool = []
+    try:
+        slugs = os.listdir(base)
+    except Exception:
+        slugs = []
+    for slug in slugs:
+        d = os.path.join(base, slug)
+        if not os.path.isdir(d) or os.path.normpath(d) == cur_dir:
+            continue
+        try:
+            files = os.listdir(d)
+        except Exception:
+            continue
+        for f in files:
+            if not f.endswith(".jsonl"):
+                continue
+            p = os.path.join(d, f)
+            if not os.path.isfile(p):
+                continue
+            try:
+                pool.append((f[:-6], os.path.getmtime(p), p))
+            except Exception:
+                continue
+    pool.sort(key=lambda x: x[1], reverse=True)
+    others = [(s, mt, p, session_cwd(p)) for s, mt, p in pool[:GLOBAL_OTHER]]
+    return mine, others
+
+
+def _sess_btn_label(mt, path, sid, prefix=""):
+    when = time.strftime("%d/%m %H:%M", time.localtime(mt))
+    prev = session_preview(path, maxlen=28) or sid[:8]
+    return ("%s%s · %s" % (prefix, when, prev))[:60]
+
+
+def global_sessions_kb():
+    """(text, keyboard) for /sessions: current project's sessions first, then
+    other recent projects. Each button jumps straight to that project+session."""
+    cur = STATE["cwd"]
+    cur_sid = STATE["sessions"].get(cur)
+    mine, others = global_sessions(cur)
+    rows = []
+    for s, mt, p in mine:
+        mark = "✅ " if s == cur_sid else "↩️ "
+        rows.append([(mark + _sess_btn_label(mt, p, s), "gsx:" + s)])
+    for s, mt, p, cwd in others:
+        proj = os.path.basename(os.path.normpath(cwd or "?")) or "?"
+        rows.append([(_sess_btn_label(mt, p, s, prefix="📁 %s · " % proj),
+                      "gsx:" + s)])
+    head = ("🗂️ *Sessões*\n📂 atual: %s\n"
+            "as de baixo pulam direto pro projeto delas." % cur)
+    if not rows:
+        head = "🗂️ Nenhuma sessão encontrada ainda."
+    return head, rows
 
 
 # --- /ls project browser ----------------------------------------------------
