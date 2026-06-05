@@ -87,6 +87,9 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 EFFORT = CFG.get("CLAUDE_EFFORT", "high")
 if EFFORT not in EFFORT_LEVELS:
     EFFORT = "high"
+# Fast model for /btw one-shot lookups (no --resume, never touches a project
+# session, so it can run concurrently with the main task).
+QUICK_MODEL = CFG.get("QUICK_MODEL", "sonnet")
 DEFAULT_CWD = CFG.get("DEFAULT_CWD", "/mnt/c/Coding")
 STATE_PATH = CFG.get("STATE_PATH", "/root/telegram-bridge/state.json")
 CLAUDE_TIMEOUT = int(CFG.get("CLAUDE_TIMEOUT", "1800") or "1800")
@@ -308,6 +311,50 @@ def typing(chat_id):
         pass
 
 
+# --- inline keyboards -------------------------------------------------------
+# A keyboard is a list of rows; each row a list of (label, callback_data).
+def _ikb(rows):
+    return json.dumps({"inline_keyboard":
+                       [[{"text": lbl, "callback_data": data}
+                         for lbl, data in row] for row in rows]})
+
+
+def send_kb(chat_id, text, rows):
+    """Send a message carrying an inline keyboard."""
+    try:
+        tg("sendMessage", {"chat_id": chat_id, "text": md_to_html(text),
+                           "parse_mode": "HTML",
+                           "disable_web_page_preview": "true",
+                           "reply_markup": _ikb(rows)})
+    except Exception:
+        tg("sendMessage", {"chat_id": chat_id, "text": text,
+                           "reply_markup": _ikb(rows)})
+
+
+def edit_kb(chat_id, message_id, text, rows):
+    """Edit a message in place (text + keyboard) — used to navigate menus
+    without spamming new messages."""
+    try:
+        tg("editMessageText", {"chat_id": chat_id, "message_id": message_id,
+                               "text": md_to_html(text), "parse_mode": "HTML",
+                               "disable_web_page_preview": "true",
+                               "reply_markup": _ikb(rows)})
+    except Exception as e:
+        sys.stderr.write("edit_kb error: %s\n" % e)
+
+
+def answer_cb(cb_id, text=None):
+    """Acknowledge a callback_query so Telegram stops the spinner; optional
+    toast text."""
+    params = {"callback_query_id": cb_id}
+    if text:
+        params["text"] = text
+    try:
+        tg("answerCallbackQuery", params)
+    except Exception:
+        pass
+
+
 def tg_download_file(file_id, dest_dir, name_hint=None):
     """Resolve a Telegram file_id and download its bytes into dest_dir.
     Returns the absolute local path, or None on failure. Bot API caps
@@ -505,6 +552,57 @@ def run_claude(chat_id, cwd, prompt, _retry=False):
     return tools, result_text
 
 
+def run_quick(chat_id, prompt):
+    """One-shot ephemeral lookup: a FRESH session (no --resume), the fast
+    QUICK_MODEL, web search allowed. It never touches a project's stored
+    session, so it runs concurrently with the main task without disturbing it.
+    Returns the answer text."""
+    args = [CLAUDE_BIN, "-p", prompt,
+            "--model", QUICK_MODEL,
+            "--permission-mode", "bypassPermissions",
+            "--output-format", "stream-json", "--verbose"]
+
+    env = dict(os.environ)
+    if OAUTH:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = OAUTH
+    if os.name != "nt" and not IS_MAC:
+        env["HOME"] = "/root"
+        env["IS_SANDBOX"] = "1"
+        env.setdefault("PATH",
+                       "/root/.local/bin:/usr/local/sbin:/usr/local/bin:"
+                       "/usr/sbin:/usr/bin:/sbin:/bin")
+
+    result_text = None
+    try:
+        proc = subprocess.Popen(args, cwd=STATE["cwd"], env=env,
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8",
+                                errors="replace", bufsize=1,
+                                creationflags=CREATE_NO_WINDOW)
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if ev.get("type") == "result":
+                result_text = ev.get("result")
+        proc.wait(timeout=CLAUDE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return "⏱️ /btw: timeout."
+    except Exception as e:
+        return "💥 /btw erro: %s" % e
+    return result_text or "⚠️ /btw: sem resultado."
+
+
 # -------------------------------------------------------------- commands ----
 HELP = (
     "Claude Code via Telegram (owner-only)\n"
@@ -518,6 +616,8 @@ HELP = (
     "/model <opus|sonnet|haiku> — troca o modelo\n"
     "/effort <low|medium|high|xhigh|max> — esforço de raciocínio\n"
     "/status — uptime, dir, modelo, esforço, MCP servers\n"
+    "/menu — abre o menu de botões\n"
+    "/btw <pergunta> — lookup rápido efêmero (sessão à parte)\n"
     "/help — esta ajuda"
 )
 
@@ -532,8 +632,71 @@ BOT_COMMANDS = [
     ("model", "troca o modelo (opus|sonnet|haiku)"),
     ("effort", "esforço (low|medium|high|xhigh|max)"),
     ("status", "uptime, dir, modelo, esforço, MCP"),
+    ("menu", "menu de botões"),
+    ("btw", "lookup rápido efêmero (sessão à parte)"),
     ("help", "esta ajuda"),
 ]
+
+
+# --- menu keyboards (navigated in place via edit_kb) ------------------------
+def main_menu_kb():
+    return [
+        [("📁 Projetos", "ls"), ("↩️ Sessões", "resume")],
+        [("🧠 Modelo", "menu:model"), ("⚡ Esforço", "menu:effort")],
+        [("📊 Status", "status"), ("🆕 Nova sessão", "new")],
+    ]
+
+
+def model_kb():
+    """One row per model. Labels are capitalized for looks; the callback_data
+    keeps the lowercase id claude expects."""
+    cur = STATE.get("model")
+    rows = [[(("✅ " if m == cur else "") + m.capitalize(), "model:" + m)]
+            for m in ("opus", "sonnet", "haiku")]
+    rows.append([("‹ voltar", "menu:main")])
+    return rows
+
+
+def effort_kb():
+    cur = STATE.get("effort")
+    rows = [[(("✅ " if e == cur else "") + e, "effort:" + e)]
+            for e in EFFORT_LEVELS]
+    rows.append([("‹ voltar", "menu:main")])
+    return rows
+
+
+def handle_callback(cb):
+    """Route an inline-keyboard tap. Menu navigation edits the message in
+    place; actions (status/new) fall through to the text handler."""
+    data = cb.get("data", "")
+    cb_id = cb.get("id")
+    m = cb.get("message") or {}
+    chat_id = (m.get("chat") or {}).get("id")
+    mid = m.get("message_id")
+    if data == "menu:main":
+        edit_kb(chat_id, mid, "📋 *Menu*", main_menu_kb())
+    elif data == "menu:model":
+        edit_kb(chat_id, mid, "🧠 *Modelo*", model_kb())
+    elif data == "menu:effort":
+        edit_kb(chat_id, mid, "⚡ *Esforço*", effort_kb())
+    elif data.startswith("model:"):
+        sel = data.split(":", 1)[1]
+        if sel in ("opus", "sonnet", "haiku"):
+            STATE["model"] = sel
+            save_state()
+        answer_cb(cb_id, "modelo: %s" % sel)
+        return edit_kb(chat_id, mid, "🧠 *Modelo* → %s" % sel, model_kb())
+    elif data.startswith("effort:"):
+        sel = data.split(":", 1)[1]
+        if sel in EFFORT_LEVELS:
+            STATE["effort"] = sel
+            save_state()
+        answer_cb(cb_id, "esforço: %s" % sel)
+        return edit_kb(chat_id, mid, "⚡ *Esforço* → %s" % sel, effort_kb())
+    elif data in ("status", "new", "ls", "resume"):
+        answer_cb(cb_id)
+        return handle(chat_id, "/" + data)
+    answer_cb(cb_id)
 
 
 def set_commands():
@@ -675,6 +838,15 @@ def handle(chat_id, text):
         arg = parts[1] if len(parts) > 1 else ""
         if cmd in ("/help", "/start"):
             return send(chat_id, HELP)
+        if cmd == "/menu":
+            return send_kb(chat_id, "📋 *Menu*", main_menu_kb())
+        if cmd == "/btw":
+            q = arg.strip()
+            if not q:
+                return send(chat_id, "use: /btw <pergunta> — lookup rápido "
+                            "numa sessão à parte (não mexe no projeto).")
+            typing(chat_id)
+            return send(chat_id, "💡 " + run_quick(chat_id, q))
         if cmd == "/pwd":
             cwd = STATE["cwd"]
             sid = STATE["sessions"].get(cwd)
@@ -801,6 +973,89 @@ def handle(chat_id, text):
     send(chat_id, prefix + (out or ""))
 
 
+# ----------------------------------------------------------- dispatch ----
+def _run_callback(cb):
+    try:
+        handle_callback(cb)
+    except Exception as e:
+        sys.stderr.write("callback error: %s\n" % e)
+        try:
+            answer_cb(cb.get("id"))
+        except Exception:
+            pass
+
+
+def process_message(msg):
+    """Handle one Telegram message end to end (owner gate, media ingest,
+    dispatch to handle). Runs on its own daemon thread per message."""
+    frm = (msg.get("from") or {}).get("id")
+    chat_id = (msg.get("chat") or {}).get("id")
+    text = msg.get("text", "")
+    # ---- OWNER GATE: reject everyone else BEFORE touching claude ----
+    if frm != OWNER_ID:
+        sys.stderr.write("denied uid=%s\n" % frm)
+        return
+
+    # Photo (largest size) or image document -> download to tmp/ and hand the
+    # agent the file path; its Read tool ingests the image. Caption becomes the
+    # prompt; no caption -> a default instruction.
+    photo = msg.get("photo")
+    doc = msg.get("document")
+    file_id = None
+    if photo:
+        file_id = photo[-1].get("file_id")
+    elif doc and (doc.get("mime_type") or "").startswith("image/"):
+        file_id = doc.get("file_id")
+    if file_id:
+        img_path = tg_download_file(file_id, TMP_DIR)
+        if not img_path:
+            return send(chat_id, "⚠️ não consegui baixar a imagem do Telegram.")
+        instruction = (msg.get("caption") or "").strip() or "Analise esta imagem."
+        text = ("[Imagem recebida via Telegram, salva em: %s]\n\n%s"
+                % (img_path, instruction))
+
+    # Voice / audio / round-video -> download, transcribe, use as prompt.
+    voice = msg.get("voice") or msg.get("audio") or msg.get("video_note")
+    is_audio_doc = doc and (doc.get("mime_type") or "").startswith("audio/")
+    if not file_id and (voice or is_audio_doc):
+        aud_path = tg_download_file((voice or doc).get("file_id"), TMP_DIR)
+        if not aud_path:
+            return send(chat_id, "⚠️ não consegui baixar o áudio do Telegram.")
+        if not (STT_CMD or STT_API_KEY):
+            return send(chat_id, "🎙️ áudio recebido, mas a transcrição não "
+                        "está configurada (defina STT_CMD ou STT_API_KEY em "
+                        "bridge.env).")
+        typing(chat_id)
+        transcript = transcribe_audio(aud_path)
+        if not transcript:
+            return send(chat_id, "⚠️ não consegui transcrever o áudio.")
+        send(chat_id, "🎙️ *transcrição:* %s" % transcript)
+        caption = (msg.get("caption") or "").strip()
+        text = "%s\n\n%s" % (caption, transcript) if caption else transcript
+
+    # Any other document (PDF, text, code, spreadsheet...) -> download and hand
+    # the path to the agent. Its Read tool ingests text/PDF; other formats fall
+    # back to its own tools.
+    if not text and doc and not is_audio_doc:
+        doc_path = tg_download_file(doc.get("file_id"), TMP_DIR,
+                                    name_hint=doc.get("file_name"))
+        if not doc_path:
+            return send(chat_id, "⚠️ não consegui baixar o documento do Telegram.")
+        fname = doc.get("file_name") or os.path.basename(doc_path)
+        instruction = (msg.get("caption") or "").strip() or "Analise este documento."
+        text = ("[Documento recebido via Telegram: %s, salvo em: %s]\n\n%s"
+                % (fname, doc_path, instruction))
+
+    if not text:
+        return send(chat_id, "(só texto, imagem, áudio e documentos são "
+                    "suportados)")
+    try:
+        handle(chat_id, text)
+    except Exception as e:
+        send(chat_id, "💥 erro no bridge: %s" % e)
+        sys.stderr.write("handle error: %s\n" % e)
+
+
 # ------------------------------------------------------------------ main ----
 def main():
     # OAUTH is optional: on Windows (and where ~/.claude/.credentials.json
@@ -844,80 +1099,24 @@ def main():
         for upd in resp.get("result", []):
             STATE["offset"] = upd["update_id"] + 1
             save_state()
+            # Inline-keyboard taps. Owner-gated like messages; handled on their
+            # own thread so a menu navigation never waits on a running turn.
+            cb = upd.get("callback_query")
+            if cb:
+                if (cb.get("from") or {}).get("id") != OWNER_ID:
+                    answer_cb(cb.get("id"))
+                    continue
+                threading.Thread(target=_run_callback, args=(cb,),
+                                 daemon=True).start()
+                continue
             msg = upd.get("message") or upd.get("edited_message")
             if not msg:
                 continue
-            frm = (msg.get("from") or {}).get("id")
-            chat_id = (msg.get("chat") or {}).get("id")
-            text = msg.get("text", "")
-            # ---- OWNER GATE: reject everyone else BEFORE touching claude ----
-            if frm != OWNER_ID:
-                sys.stderr.write("denied uid=%s\n" % frm)
-                continue
-
-            # Photo (largest size) or image document -> download to tmp/ and
-            # hand the agent the file path; its Read tool ingests the image.
-            # Caption becomes the prompt; no caption -> a default instruction.
-            photo = msg.get("photo")
-            doc = msg.get("document")
-            file_id = None
-            if photo:
-                file_id = photo[-1].get("file_id")
-            elif doc and (doc.get("mime_type") or "").startswith("image/"):
-                file_id = doc.get("file_id")
-            if file_id:
-                img_path = tg_download_file(file_id, TMP_DIR)
-                if not img_path:
-                    send(chat_id, "⚠️ não consegui baixar a imagem do Telegram.")
-                    continue
-                instruction = (msg.get("caption") or "").strip() or "Analise esta imagem."
-                text = ("[Imagem recebida via Telegram, salva em: %s]\n\n%s"
-                        % (img_path, instruction))
-
-            # Voice / audio / round-video -> download, transcribe, use as prompt.
-            voice = msg.get("voice") or msg.get("audio") or msg.get("video_note")
-            is_audio_doc = doc and (doc.get("mime_type") or "").startswith("audio/")
-            if not file_id and (voice or is_audio_doc):
-                aud_path = tg_download_file((voice or doc).get("file_id"), TMP_DIR)
-                if not aud_path:
-                    send(chat_id, "⚠️ não consegui baixar o áudio do Telegram.")
-                    continue
-                if not (STT_CMD or STT_API_KEY):
-                    send(chat_id, "🎙️ áudio recebido, mas a transcrição não está "
-                                  "configurada (defina STT_CMD ou STT_API_KEY em "
-                                  "bridge.env).")
-                    continue
-                typing(chat_id)
-                transcript = transcribe_audio(aud_path)
-                if not transcript:
-                    send(chat_id, "⚠️ não consegui transcrever o áudio.")
-                    continue
-                send(chat_id, "🎙️ *transcrição:* %s" % transcript)
-                caption = (msg.get("caption") or "").strip()
-                text = "%s\n\n%s" % (caption, transcript) if caption else transcript
-
-            # Any other document (PDF, text, code, spreadsheet...) -> download
-            # and hand the path to the agent. Its Read tool ingests text/PDF;
-            # for other formats it falls back to its own tools.
-            if not text and doc and not is_audio_doc:
-                doc_path = tg_download_file(doc.get("file_id"), TMP_DIR,
-                                            name_hint=doc.get("file_name"))
-                if not doc_path:
-                    send(chat_id, "⚠️ não consegui baixar o documento do Telegram.")
-                    continue
-                fname = doc.get("file_name") or os.path.basename(doc_path)
-                instruction = (msg.get("caption") or "").strip() or "Analise este documento."
-                text = ("[Documento recebido via Telegram: %s, salvo em: %s]\n\n%s"
-                        % (fname, doc_path, instruction))
-
-            if not text:
-                send(chat_id, "(só texto, imagem, áudio e documentos são suportados)")
-                continue
-            try:
-                handle(chat_id, text)
-            except Exception as e:
-                send(chat_id, "💥 erro no bridge: %s" % e)
-                sys.stderr.write("handle error: %s\n" % e)
+            # Each message gets its own daemon thread so a long-running turn
+            # never blocks the poll loop — that's what lets /btw and the menu
+            # stay responsive mid-action.
+            threading.Thread(target=process_message, args=(msg,),
+                             daemon=True).start()
 
 
 if __name__ == "__main__":

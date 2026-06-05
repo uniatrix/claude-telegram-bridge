@@ -215,7 +215,13 @@ Homebrew so the agent can still find tools like `pdftoppm`.
 | `/model <opus\|sonnet\|haiku>` | Switch model |
 | `/effort <low\|medium\|high\|xhigh\|max>` | Set reasoning effort (passed to `claude --effort`) |
 | `/status` | Uptime, cwd, model, effort, session id, active MCP servers |
+| `/menu` | Open the inline-button menu (model / effort / status / projects / sessions) |
+| `/btw <question>` | Quick one-shot lookup in a **separate** ephemeral session (fast model, never touches the project session — runs concurrently with the main task) |
 | `/help` | Show help |
+
+Each message and each button tap is handled on its own daemon thread, so a
+long-running turn never blocks the poll loop — `/btw` and the menu stay
+responsive mid-action.
 
 The slash-command menu is registered with Telegram at startup
 (`setMyCommands`), so the ≡ menu and `/` autocomplete stay in sync.
