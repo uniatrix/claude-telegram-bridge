@@ -1108,12 +1108,14 @@ def handle_callback(cb):
     elif data == "new":  # reset to home + clear chat (pass the menu msg id)
         answer_cb(cb_id)
         return handle(chat_id, "/new", msg_id=mid)
-    elif data == "resume":  # global session browser (grouped by project)
+    elif data == "resume":  # level 1: project list (newest activity first)
         answer_cb(cb_id)
-        head, kb = global_sessions_kb()
+        head, kb = session_projects_kb()
         return edit_kb(chat_id, mid, head, kb)
-    elif data == "noop":  # group header row -> not actionable
-        return answer_cb(cb_id)
+    elif data.startswith("gsp:"):  # level 2: sessions of one project
+        answer_cb(cb_id)
+        head, kb = project_sessions_kb(data.split(":", 1)[1])
+        return edit_kb(chat_id, mid, head, kb)
     elif data.startswith("gsx:"):  # jump to a session's project AND resume it
         sid = data.split(":", 1)[1]
         loc = find_session_file(sid)
@@ -1267,10 +1269,9 @@ def project_dir_for(cwd):
     return os.path.join(base, re.sub(r"[^a-zA-Z0-9]", "-", cwd))
 
 
-def list_sessions(cwd, limit=SESS_LIST_LIMIT):
-    """Recent sessions for cwd as [(sid, mtime, path)], newest first.
-    Only top-level *.jsonl (nested */subagents/*.jsonl are ignored)."""
-    d = project_dir_for(cwd)
+def _dir_sessions(d, limit=None):
+    """Top-level *.jsonl sessions in a project dir as [(sid, mtime, path)],
+    newest first (nested */subagents/*.jsonl are ignored)."""
     try:
         files = [f for f in os.listdir(d) if f.endswith(".jsonl")
                  and os.path.isfile(os.path.join(d, f))]
@@ -1285,6 +1286,11 @@ def list_sessions(cwd, limit=SESS_LIST_LIMIT):
             continue
     items.sort(key=lambda x: x[1], reverse=True)
     return items if limit is None else items[:limit]
+
+
+def list_sessions(cwd, limit=SESS_LIST_LIMIT):
+    """Recent sessions for cwd as [(sid, mtime, path)], newest first."""
+    return _dir_sessions(project_dir_for(cwd), limit)
 
 
 def session_preview(path, maxlen=60):
@@ -1328,11 +1334,7 @@ def find_session(cwd, sid):
     return None
 
 
-# --- global session browser (sessions across ALL projects) ------------------
-GLOBAL_MINE = 8     # current-project sessions shown at the top of /sessions
-GLOBAL_OTHER = 12   # other-project sessions pulled in below, by recency
-
-
+# --- session browser (two levels: project list -> that project's sessions) --
 def _projects_base():
     return os.path.join(os.path.expanduser("~"), ".claude", "projects")
 
@@ -1371,56 +1373,33 @@ def find_session_file(sid):
     return None
 
 
-def global_groups(cur_cwd):
-    """Sessions grouped by project: [(cwd, [(sid, mt, path), ...]), ...].
-    The current project comes first; other projects follow, each ordered by its
-    most-recent session. Only the most-recent GLOBAL_OTHER sessions from other
-    projects are pulled in (reading each transcript's cwd is the cost)."""
-    cur_key = os.path.normcase(os.path.normpath(cur_cwd))
-    groups = []  # ordered (cwd, sessions)
-    mine = list_sessions(cur_cwd, limit=GLOBAL_MINE)
-    if mine:
-        groups.append((cur_cwd, mine))
+def short_path(cwd, n=2):
+    """Last n path components, for a compact-but-unambiguous project label."""
+    parts = [p for p in re.split(r"[\\/]", cwd.rstrip("\\/")) if p]
+    return (os.sep.join(parts[-n:]) if parts else cwd) or cwd
+
+
+def session_projects(limit=24):
+    """Projects that have sessions, newest-activity first:
+    [(slug, cwd, newest_mtime, count), ...]. One transcript read per project
+    (its newest session) to recover the real cwd."""
     base = _projects_base()
-    cur_dir = os.path.normpath(project_dir_for(cur_cwd))
-    pool = []
+    out = []
     try:
         slugs = os.listdir(base)
     except Exception:
         slugs = []
     for slug in slugs:
         d = os.path.join(base, slug)
-        if not os.path.isdir(d) or os.path.normpath(d) == cur_dir:
+        if not os.path.isdir(d):
             continue
-        try:
-            files = os.listdir(d)
-        except Exception:
+        sess = _dir_sessions(d)
+        if not sess:
             continue
-        for f in files:
-            if not f.endswith(".jsonl"):
-                continue
-            p = os.path.join(d, f)
-            if not os.path.isfile(p):
-                continue
-            try:
-                pool.append((f[:-6], os.path.getmtime(p), p))
-            except Exception:
-                continue
-    pool.sort(key=lambda x: x[1], reverse=True)
-    by_cwd = {}  # normcase key -> (display_cwd, [sessions])
-    order = []
-    for s, mt, p in pool[:GLOBAL_OTHER]:
-        cwd = session_cwd(p) or "?"
-        key = os.path.normcase(os.path.normpath(cwd))
-        if key == cur_key:  # belongs to the current project -> already in mine
-            continue
-        if key not in by_cwd:
-            by_cwd[key] = (cwd, [])
-            order.append(key)
-        by_cwd[key][1].append((s, mt, p))
-    for key in order:
-        groups.append(by_cwd[key])
-    return groups
+        cwd = session_cwd(sess[0][2]) or slug
+        out.append((slug, cwd, sess[0][1], len(sess)))
+    out.sort(key=lambda x: x[2], reverse=True)
+    return out[:limit]
 
 
 def session_title(path):
@@ -1449,28 +1428,45 @@ def session_recap(path, maxlen=44):
     return (t or "").strip().replace("\n", " ")[:maxlen]
 
 
-def global_sessions_kb():
-    """(text, keyboard) for /sessions: sessions grouped under a project header,
-    current project first. A header row (📂 <cwd>, noop) labels each group; each
-    session button below shows its recap + time and jumps straight to it.
-    ✅ marks the active session of the current project."""
+def session_projects_kb():
+    """Level 1: the project list, newest-activity first, current project floated
+    to the top. Each button (gsp:<slug>) opens that project's session list."""
     cur = STATE["cwd"]
     cur_key = os.path.normcase(os.path.normpath(cur))
-    cur_sid = STATE["sessions"].get(cur)
+    projs = session_projects()
+    # current project first, then the rest keep their newest-first order
+    projs.sort(key=lambda r: os.path.normcase(os.path.normpath(r[1])) != cur_key)
     rows = []
-    for cwd, sess in global_groups(cur):
+    for slug, cwd, mt, n in projs:
         is_cur = os.path.normcase(os.path.normpath(cwd)) == cur_key
-        title = "📂 %s%s" % (cwd, "  · atual" if is_cur else "")
-        rows.append([(title[:62], "noop")])
-        for s, mt, p in sess:
-            when = time.strftime("%d/%m %H:%M", time.localtime(mt))
-            mark = "✅ " if (is_cur and s == cur_sid) else ""
-            recap = session_recap(p) or s[:8]
-            label = ("%s%s · %s" % (mark, recap, when))[:62]
-            rows.append([(label, "gsx:" + s)])
-    head = "🗂️ *Sessões* — toque numa pra retomar (pula pro projeto dela)."
+        when = time.strftime("%d/%m %H:%M", time.localtime(mt))
+        label = "📂 %s · %d · %s%s" % (short_path(cwd), n, when,
+                                       "  ✅" if is_cur else "")
+        rows.append([(label[:62], "gsp:" + slug)])
+    head = "🗂️ *Sessões* — escolha o projeto (mais recente primeiro)"
     if not rows:
         head = "🗂️ Nenhuma sessão encontrada ainda."
+    return head, rows
+
+
+def project_sessions_kb(slug):
+    """Level 2: sessions of one project (by slug), newest first. Each button
+    (gsx:<sid>) jumps to that project+session. A ‹ row returns to the list."""
+    d = os.path.join(_projects_base(), slug)
+    sess = _dir_sessions(d)
+    cwd = session_cwd(sess[0][2]) if sess else None
+    cur = STATE["cwd"]
+    is_cur = bool(cwd) and (os.path.normcase(os.path.normpath(cwd))
+                            == os.path.normcase(os.path.normpath(cur)))
+    cur_sid = STATE["sessions"].get(cur)
+    rows = [[("‹ projetos", "resume")]]
+    for s, mt, p in sess[:20]:
+        when = time.strftime("%d/%m %H:%M", time.localtime(mt))
+        mark = "✅ " if (is_cur and s == cur_sid) else ""
+        recap = session_recap(p) or s[:8]
+        label = ("%s%s · %s" % (mark, recap, when))[:62]
+        rows.append([(label, "gsx:" + s)])
+    head = "📂 *%s* — toque numa sessão pra retomar" % (cwd or slug)
     return head, rows
 
 
