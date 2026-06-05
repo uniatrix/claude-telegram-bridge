@@ -207,7 +207,7 @@ Homebrew so the agent can still find tools like `pdftoppm`.
 | *(document + caption)* | File is downloaded to `tmp/`; the caption is the prompt and the agent reads the file (no caption → "Analise este documento.") |
 | `/cd <name\|/abs/path>` | Switch project (relative names resolve under `DEFAULT_CWD`); each project keeps its own session |
 | `/pwd` | Show the current directory, model and session id |
-| `/ls` | List project folders under `DEFAULT_CWD` |
+| `/ls` | Browse project folders under `DEFAULT_CWD` as tappable buttons (paginated, 8/page). Tap a project to enter it; if it has past sessions you pick one (🆕 new or a recent session), otherwise it just enters. Folders named in `GROUP_DIRS` are 🗂️ groups that open into their own subfolders instead of becoming the cwd |
 | `/new` | Start a fresh session in the current directory |
 | `/resume` | List this project's past sessions (paginated, newest first) |
 | `/resume <n>` | Resume session number `n` from the list |
@@ -245,7 +245,9 @@ The slash-command menu is registered with Telegram at startup
 | `CLAUDE_BIN` | – | Path to the `claude` binary (default: `claude` on PATH) |
 | `CLAUDE_MODEL` | – | `opus` / `sonnet` / `haiku` (default `opus`) |
 | `CLAUDE_EFFORT` | – | `low` / `medium` / `high` / `xhigh` / `max` reasoning effort (default `high`) |
+| `QUICK_MODEL` | – | Fast model for `/btw` one-shot lookups (default `sonnet`) |
 | `DEFAULT_CWD` | – | Starting directory; parent of your projects |
+| `GROUP_DIRS` | – | Comma-separated folders under `DEFAULT_CWD` treated as groups of secondary projects in `/ls` (default `Projetos Mac Antigo`) |
 | `STATE_PATH` | – | Where session/offset state is persisted |
 | `CLAUDE_TIMEOUT` | – | Max seconds per turn before the agent is killed (default 1800) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | – | Only if `claude` is not already logged in on the host |

@@ -91,6 +91,12 @@ if EFFORT not in EFFORT_LEVELS:
 # session, so it can run concurrently with the main task).
 QUICK_MODEL = CFG.get("QUICK_MODEL", "sonnet")
 DEFAULT_CWD = CFG.get("DEFAULT_CWD", "/mnt/c/Coding")
+# Folders under DEFAULT_CWD that are *groups* of secondary projects rather than
+# projects themselves: in the /ls browser they open into their own subfolders
+# instead of becoming the cwd. Comma-separated, case-insensitive.
+GROUP_DIRS = [g.strip().lower()
+              for g in CFG.get("GROUP_DIRS", "Projetos Mac Antigo").split(",")
+              if g.strip()]
 STATE_PATH = CFG.get("STATE_PATH", "/root/telegram-bridge/state.json")
 CLAUDE_TIMEOUT = int(CFG.get("CLAUDE_TIMEOUT", "1800") or "1800")
 
@@ -151,6 +157,7 @@ if STATE["effort"] not in EFFORT_LEVELS:
 STATE.setdefault("sessions", {})
 STATE.setdefault("resume_page", {})
 STATE.setdefault("mcp_disabled", [])  # user-scope MCP servers turned off
+STATE["ls_base"] = DEFAULT_CWD  # /ls browse root; always reset to home on boot
 
 # Process start time, for /status uptime. time.time() is fine here (this is
 # bridge.py, not a workflow script).
@@ -826,7 +833,52 @@ def handle_callback(cb):
     elif data == "mcpinfo":
         return answer_cb(cb_id, "Desligar tira o server deste e dos próximos "
                          "turns, até religar aqui.")
-    elif data in ("status", "new", "ls", "resume"):
+    elif data == "ls":  # open / return to the browse root, in place
+        STATE["ls_base"] = DEFAULT_CWD
+        answer_cb(cb_id)
+        head, kb = ls_view(0)
+        return edit_kb(chat_id, mid, head, kb)
+    elif data.startswith("lsp:"):  # paginate the current browse base
+        answer_cb(cb_id)
+        head, kb = ls_view(int(data.split(":", 1)[1]))
+        return edit_kb(chat_id, mid, head, kb)
+    elif data.startswith("grp:"):  # enter a group folder
+        ordered, _ = _ls_ordered(STATE.get("ls_base", DEFAULT_CWD))
+        idx = int(data.split(":", 1)[1])
+        if 0 <= idx < len(ordered):
+            STATE["ls_base"] = os.path.join(STATE["ls_base"], ordered[idx])
+        answer_cb(cb_id)
+        head, kb = ls_view(0)
+        return edit_kb(chat_id, mid, head, kb)
+    elif data.startswith("cd:"):  # enter a project as the new cwd
+        ordered, _ = _ls_ordered(STATE.get("ls_base", DEFAULT_CWD))
+        idx = int(data.split(":", 1)[1])
+        if not (0 <= idx < len(ordered)):
+            return answer_cb(cb_id, "índice inválido")
+        path = os.path.join(STATE["ls_base"], ordered[idx])
+        STATE["cwd"] = path
+        save_state()
+        answer_cb(cb_id, ordered[idx])
+        if list_sessions(path):  # has history -> let the user pick a session
+            return edit_kb(chat_id, mid, "📁 %s\nescolha a sessão:" % path,
+                           session_choice_kb(path))
+        return edit_kb(chat_id, mid, "📁 cwd → %s (sessão nova)" % path, [])
+    elif data == "sxnew":  # fresh session in the current cwd
+        with STATE_LOCK:
+            STATE["sessions"].pop(STATE["cwd"], None)
+            save_state()
+        answer_cb(cb_id, "sessão nova")
+        return edit_kb(chat_id, mid, "🆕 sessão nova em %s" % STATE["cwd"], [])
+    elif data.startswith("sx:"):  # resume a specific session in the current cwd
+        sid = data.split(":", 1)[1]
+        with STATE_LOCK:
+            STATE["sessions"][STATE["cwd"]] = sid
+            save_state()
+        answer_cb(cb_id, "sessão %s" % sid[:8])
+        return edit_kb(chat_id, mid, "↩️ sessão → %s\n📁 %s\n"
+                       "a próxima mensagem continua essa conversa."
+                       % (sid[:8], STATE["cwd"]), session_choice_kb(STATE["cwd"]))
+    elif data in ("status", "new", "resume"):
         answer_cb(cb_id)
         return handle(chat_id, "/" + data)
     answer_cb(cb_id)
@@ -1027,6 +1079,74 @@ def find_session(cwd, sid):
     return None
 
 
+# --- /ls project browser ----------------------------------------------------
+PROJECTS_PAGE = 8  # project folders shown per /ls page
+
+
+def _list_dirs(base):
+    try:
+        return sorted(d for d in os.listdir(base)
+                      if os.path.isdir(os.path.join(base, d)))
+    except Exception:
+        return []
+
+
+def _ls_ordered(base):
+    """Folders in base as (ordered_list, at_root). At the browse root, GROUP_DIRS
+    float to the top; the order is deterministic so cd:/grp: indices stay valid
+    page to page."""
+    at_root = os.path.normpath(base) == os.path.normpath(DEFAULT_CWD)
+    dirs = _list_dirs(base)
+    if at_root and GROUP_DIRS:
+        groups = [d for d in dirs if d.lower() in GROUP_DIRS]
+        normal = [d for d in dirs if d.lower() not in GROUP_DIRS]
+        return groups + normal, at_root
+    return dirs, at_root
+
+
+def ls_view(page=0):
+    """(text, keyboard) for STATE['ls_base'] at the given page."""
+    base = STATE.get("ls_base", DEFAULT_CWD)
+    ordered, at_root = _ls_ordered(base)
+    total = len(ordered)
+    pages = max(1, (total + PROJECTS_PAGE - 1) // PROJECTS_PAGE)
+    page = max(0, min(page, pages - 1))
+    start = page * PROJECTS_PAGE
+    chunk = ordered[start:start + PROJECTS_PAGE]
+    rows = []
+    if not at_root:  # inside a group -> a row back to the browse root
+        rows.append([("‹ %s" % os.path.basename(os.path.normpath(DEFAULT_CWD)),
+                      "ls")])
+    for j, name in enumerate(chunk):
+        idx = start + j
+        if at_root and name.lower() in GROUP_DIRS:
+            rows.append([("🗂️ %s" % name, "grp:%d" % idx)])
+        else:
+            rows.append([("📁 %s" % name, "cd:%d" % idx)])
+    nav = []
+    if page > 0:
+        nav.append(("‹", "lsp:%d" % (page - 1)))
+    if page < pages - 1:
+        nav.append(("›", "lsp:%d" % (page + 1)))
+    if nav:
+        rows.append(nav)
+    head = ("📂 %s\npág. %d/%d · %d pasta(s)" % (base, page + 1, pages, total)
+            if total else "📂 %s\n(vazio)" % base)
+    return head, rows
+
+
+def session_choice_kb(cwd):
+    """Keyboard to pick a session after entering a project with history:
+    🆕 nova + one button per recent session (full sid in callback_data)."""
+    cur = STATE["sessions"].get(cwd)
+    rows = [[("🆕 nova", "sxnew")]]
+    for s, _mt, pth in list_sessions(cwd, limit=8):
+        mark = "✅ " if s == cur else ""
+        prev = session_preview(pth) or s[:8]
+        rows.append([(mark + prev[:40], "sx:" + s)])
+    return rows
+
+
 def handle(chat_id, text):
     t = text.strip()
     if t.startswith("/"):
@@ -1056,13 +1176,9 @@ def handle(chat_id, text):
                         % (cwd, STATE.get("model"), STATE.get("effort"),
                            sid or "(nova)"))
         if cmd == "/ls":
-            try:
-                items = sorted(d for d in os.listdir(DEFAULT_CWD)
-                               if os.path.isdir(os.path.join(DEFAULT_CWD, d)))
-                return send(chat_id, "Projetos em %s:\n%s"
-                            % (DEFAULT_CWD, "\n".join(items) or "(vazio)"))
-            except Exception as e:
-                return send(chat_id, "erro: %s" % e)
+            STATE["ls_base"] = DEFAULT_CWD  # always start at the browse root
+            head, kb = ls_view(0)
+            return send_kb(chat_id, head, kb)
         if cmd == "/cd":
             path = resolve_cwd(arg)
             if not path:
