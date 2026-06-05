@@ -161,6 +161,15 @@ _BOLD = re.compile(r"\*\*([^\n]+?)\*\*")
 _ITALIC = re.compile(r"(?<![\*\w])\*([^\*\n]+?)\*(?![\*\w])")
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.*)$", re.MULTILINE)
 _BULLET = re.compile(r"^(\s*)[-*]\s+(?=\S)", re.MULTILINE)
+_STRIKE = re.compile(r"~~([^\n]+?)~~")
+_QUOTE = re.compile(r"^\s*>\s?")
+# A markdown table separator row, e.g. "| --- | :--: |" (the line under the
+# header). Its presence is what tells a pipe-laden line apart from prose.
+_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
+
+# A quoted block longer than this collapses to a tap-to-expand blockquote so a
+# long quote doesn't flood the chat. Telegram renders <blockquote expandable>.
+QUOTE_EXPANDABLE_MIN = 400
 
 
 def _inline_md(s):  # s is already HTML-escaped
@@ -168,6 +177,7 @@ def _inline_md(s):  # s is already HTML-escaped
     s = _BULLET.sub(r"\1• ", s)
     s = _LINK.sub(lambda m: '<a href="%s">%s</a>' % (m.group(2), m.group(1)), s)
     s = _BOLD.sub(r"<b>\1</b>", s)
+    s = _STRIKE.sub(r"<s>\1</s>", s)
     s = _ITALIC.sub(r"<i>\1</i>", s)
     return s
 
@@ -183,13 +193,71 @@ def _segment_to_html(seg):
     return "".join(out)
 
 
+def _split_row(line):
+    """Split one markdown table row into trimmed cells, dropping the optional
+    leading/trailing pipe."""
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _render_table(rows):
+    """Render a markdown table (list of cell-lists, header first) as aligned
+    monospace inside <pre> — Telegram has no <table>. Column widths use the
+    raw (visible) cell length; cells are HTML-escaped after alignment so the
+    padding still lines up once entities collapse to single glyphs."""
+    cols = max(len(r) for r in rows)
+    norm = [r + [""] * (cols - len(r)) for r in rows]
+    widths = [max(len(row[c]) for row in norm) for c in range(cols)]
+    lines = [" | ".join(row[c].ljust(widths[c]) for c in range(cols))
+             for row in norm]
+    return "<pre>%s</pre>" % html.escape("\n".join(lines), quote=False)
+
+
+def _prose_to_html(seg):
+    """Block-level pass over a prose segment (text between fenced code blocks):
+    pull out markdown tables and > blockquotes; everything else is rendered
+    line-by-line through the inline renderer."""
+    lines = seg.split("\n")
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        line = lines[i]
+        # Table: a pipe row immediately followed by a separator row.
+        if "|" in line and i + 1 < n and _TABLE_SEP.match(lines[i + 1]):
+            rows = [_split_row(line)]
+            i += 2  # consume header + separator
+            while i < n and lines[i].strip() and "|" in lines[i]:
+                rows.append(_split_row(lines[i]))
+                i += 1
+            out.append(_render_table(rows))
+            continue
+        # Blockquote: run of consecutive "> " lines.
+        if _QUOTE.match(line):
+            q = []
+            while i < n and _QUOTE.match(lines[i]):
+                q.append(_QUOTE.sub("", lines[i]))
+                i += 1
+            raw = "\n".join(q)
+            inner = "\n".join(_segment_to_html(ql) for ql in q)
+            tag = ("blockquote expandable"
+                   if len(raw) > QUOTE_EXPANDABLE_MIN else "blockquote")
+            out.append("<%s>%s</blockquote>" % (tag, inner))
+            continue
+        out.append(_segment_to_html(line))
+        i += 1
+    return "\n".join(out)
+
+
 def md_to_html(text):
     out, pos = [], 0
     for m in _CODE_BLOCK.finditer(text):
-        out.append(_segment_to_html(text[pos:m.start()]))
+        out.append(_prose_to_html(text[pos:m.start()]))
         out.append("<pre>%s</pre>" % html.escape(m.group(1), quote=False))
         pos = m.end()
-    out.append(_segment_to_html(text[pos:]))
+    out.append(_prose_to_html(text[pos:]))
     return "".join(out)
 
 

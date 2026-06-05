@@ -46,8 +46,10 @@ You accept this risk by running it.
 - **Project hopping** — `/ls` to list projects, `/cd` to switch (each keeps its
   own session).
 - **Mobile-friendly output** — Claude's markdown is converted to Telegram HTML
-  (bold, italic, inline `code`, fenced blocks, links, headings, bullets),
-  long replies are chunked at 4000 chars, and a "typing…" indicator runs while
+  (bold, italic, strikethrough, inline `code`, fenced blocks, links, headings,
+  bullets, and `>` blockquotes — long quotes collapse to tap-to-expand).
+  Markdown tables become aligned monospace blocks (Telegram has no `<table>`).
+  Long replies are chunked at 4000 chars, and a "typing…" indicator runs while
   the agent works.
 - **Tool transparency** — each reply is prefixed with a `🔧` summary of the
   tools the agent used that turn.
