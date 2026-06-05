@@ -1108,10 +1108,12 @@ def handle_callback(cb):
     elif data == "new":  # reset to home + clear chat (pass the menu msg id)
         answer_cb(cb_id)
         return handle(chat_id, "/new", msg_id=mid)
-    elif data == "resume":  # global session browser (current project + others)
+    elif data == "resume":  # global session browser (grouped by project)
         answer_cb(cb_id)
         head, kb = global_sessions_kb()
         return edit_kb(chat_id, mid, head, kb)
+    elif data == "noop":  # group header row -> not actionable
+        return answer_cb(cb_id)
     elif data.startswith("gsx:"):  # jump to a session's project AND resume it
         sid = data.split(":", 1)[1]
         loc = find_session_file(sid)
@@ -1327,8 +1329,8 @@ def find_session(cwd, sid):
 
 
 # --- global session browser (sessions across ALL projects) ------------------
-GLOBAL_MINE = 6     # current-project sessions shown at the top of /sessions
-GLOBAL_OTHER = 8    # other-project sessions shown below, by recency
+GLOBAL_MINE = 8     # current-project sessions shown at the top of /sessions
+GLOBAL_OTHER = 12   # other-project sessions pulled in below, by recency
 
 
 def _projects_base():
@@ -1369,10 +1371,16 @@ def find_session_file(sid):
     return None
 
 
-def global_sessions(cur_cwd):
-    """(mine, others): mine = recent sessions of cur_cwd as [(sid, mt, path)];
-    others = most-recent sessions from OTHER projects as [(sid, mt, path, cwd)]."""
+def global_groups(cur_cwd):
+    """Sessions grouped by project: [(cwd, [(sid, mt, path), ...]), ...].
+    The current project comes first; other projects follow, each ordered by its
+    most-recent session. Only the most-recent GLOBAL_OTHER sessions from other
+    projects are pulled in (reading each transcript's cwd is the cost)."""
+    cur_key = os.path.normcase(os.path.normpath(cur_cwd))
+    groups = []  # ordered (cwd, sessions)
     mine = list_sessions(cur_cwd, limit=GLOBAL_MINE)
+    if mine:
+        groups.append((cur_cwd, mine))
     base = _projects_base()
     cur_dir = os.path.normpath(project_dir_for(cur_cwd))
     pool = []
@@ -1399,8 +1407,20 @@ def global_sessions(cur_cwd):
             except Exception:
                 continue
     pool.sort(key=lambda x: x[1], reverse=True)
-    others = [(s, mt, p, session_cwd(p)) for s, mt, p in pool[:GLOBAL_OTHER]]
-    return mine, others
+    by_cwd = {}  # normcase key -> (display_cwd, [sessions])
+    order = []
+    for s, mt, p in pool[:GLOBAL_OTHER]:
+        cwd = session_cwd(p) or "?"
+        key = os.path.normcase(os.path.normpath(cwd))
+        if key == cur_key:  # belongs to the current project -> already in mine
+            continue
+        if key not in by_cwd:
+            by_cwd[key] = (cwd, [])
+            order.append(key)
+        by_cwd[key][1].append((s, mt, p))
+    for key in order:
+        groups.append(by_cwd[key])
+    return groups
 
 
 def session_title(path):
@@ -1429,31 +1449,26 @@ def session_recap(path, maxlen=44):
     return (t or "").strip().replace("\n", " ")[:maxlen]
 
 
-def _sess_btn_label(mt, path, sid, tag=None):
-    """Recap-first label. tag (a project name) is appended for other-project
-    rows; current-project rows show the time instead."""
-    recap = session_recap(path) or sid[:8]
-    suffix = ("📁 %s" % tag) if tag else time.strftime("%d/%m %H:%M",
-                                                       time.localtime(mt))
-    return ("%s · %s" % (recap, suffix))[:62]
-
-
 def global_sessions_kb():
-    """(text, keyboard) for /sessions: current project's sessions first, then
-    other recent projects. Each button jumps straight to that project+session."""
+    """(text, keyboard) for /sessions: sessions grouped under a project header,
+    current project first. A header row (📂 <cwd>, noop) labels each group; each
+    session button below shows its recap + time and jumps straight to it.
+    ✅ marks the active session of the current project."""
     cur = STATE["cwd"]
+    cur_key = os.path.normcase(os.path.normpath(cur))
     cur_sid = STATE["sessions"].get(cur)
-    mine, others = global_sessions(cur)
     rows = []
-    for s, mt, p in mine:
-        mark = "✅ " if s == cur_sid else "↩️ "
-        rows.append([(mark + _sess_btn_label(mt, p, s), "gsx:" + s)])
-    for s, mt, p, cwd in others:
-        proj = os.path.basename(os.path.normpath(cwd or "?")) or "?"
-        rows.append([(_sess_btn_label(mt, p, s, tag=proj), "gsx:" + s)])
-    head = ("🗂️ *Sessões* — toque pra retomar\n"
-            "📂 atuais (%s) primeiro, depois outros projetos."
-            % (os.path.basename(os.path.normpath(cur)) or cur))
+    for cwd, sess in global_groups(cur):
+        is_cur = os.path.normcase(os.path.normpath(cwd)) == cur_key
+        title = "📂 %s%s" % (cwd, "  · atual" if is_cur else "")
+        rows.append([(title[:62], "noop")])
+        for s, mt, p in sess:
+            when = time.strftime("%d/%m %H:%M", time.localtime(mt))
+            mark = "✅ " if (is_cur and s == cur_sid) else ""
+            recap = session_recap(p) or s[:8]
+            label = ("%s%s · %s" % (mark, recap, when))[:62]
+            rows.append([(label, "gsx:" + s)])
+    head = "🗂️ *Sessões* — toque numa pra retomar (pula pro projeto dela)."
     if not rows:
         head = "🗂️ Nenhuma sessão encontrada ainda."
     return head, rows
