@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import threading
@@ -26,6 +27,22 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 
+IS_MAC = sys.platform == "darwin"
+
+# IPv4-first DNS. On an IPv4-only network (common on home/cellular links) a
+# stale AAAA record can stall every outbound connection — the Telegram
+# long-poll, getFile, media downloads — until the IPv6 attempt times out.
+# Reorder getaddrinfo so A records are tried first; IPv6 stays as a fallback.
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_first_getaddrinfo(*args, **kwargs):
+    res = _orig_getaddrinfo(*args, **kwargs)
+    return sorted(res, key=lambda r: 0 if r[0] == socket.AF_INET else 1)
+
+
+socket.getaddrinfo = _ipv4_first_getaddrinfo
+
 # pythonw.exe (used by the Windows scheduled task) has no console, so
 # sys.stderr is None and any .write() would crash. Route it to a log file.
 if sys.stderr is None:
@@ -33,7 +50,10 @@ if sys.stderr is None:
     sys.stderr = open(os.path.join(_logdir, "bridge.log"), "a",
                       buffering=1, encoding="utf-8", errors="replace")
 
-if os.name == "nt":
+if os.name == "nt" or IS_MAC:
+    # Windows and macOS keep bridge.env next to the script. macOS launchd
+    # LaunchAgents run from an arbitrary cwd, so an absolute default beats a
+    # relative one; the script dir is stable.
     DEF_ENV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "bridge.env")
 else:
@@ -313,9 +333,14 @@ def run_claude(chat_id, cwd, prompt, _retry=False):
     # On Windows claude uses the logged-in credentials file; no token needed.
     if OAUTH:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = OAUTH
-    if os.name != "nt":
-        # claude refuses --permission-mode bypassPermissions as root unless it
-        # believes it is sandboxed. WSL is the dev's sandbox; risk accepted.
+    if os.name != "nt" and not IS_MAC:
+        # Linux/WSL: claude refuses --permission-mode bypassPermissions as root
+        # unless it believes it is sandboxed. WSL is the dev's sandbox; risk
+        # accepted. macOS runs as a normal (non-root) user, so it needs none of
+        # this — and forcing HOME=/root there would break credential lookup.
+        # On macOS the PATH (incl. Homebrew, for pdftoppm etc.) comes from the
+        # launchd plist; CLAUDE_BIN must be absolute since launchd ignores the
+        # shell PATH.
         env["HOME"] = "/root"
         env["IS_SANDBOX"] = "1"
         env.setdefault("PATH",
