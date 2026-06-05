@@ -157,6 +157,7 @@ if STATE["effort"] not in EFFORT_LEVELS:
 STATE.setdefault("sessions", {})
 STATE.setdefault("resume_page", {})
 STATE.setdefault("mcp_disabled", [])  # user-scope MCP servers turned off
+STATE.setdefault("live_runs", {})  # crash-recovery snapshots of streaming runs
 STATE["ls_base"] = DEFAULT_CWD  # /ls browse root; always reset to home on boot
 
 # Process start time, for /status uptime. time.time() is fine here (this is
@@ -170,6 +171,35 @@ START_TIME = time.time()
 # one stuck turn can't block later messages.
 ACTIVE = {}
 ACTIVE_LOCK = threading.Lock()
+
+
+class _Counter:
+    """Thread-safe in-flight counter. A turn is 'in flight' from when handle()
+    enters run_claude until it finishes delivering — used by the restart
+    watcher to drain runs before os.execv (a run leaves ACTIVE before its final
+    message is sent, so ACTIVE alone would drain too early)."""
+    def __init__(self):
+        self._n = 0
+        self._lock = threading.Lock()
+
+    def increment(self):
+        with self._lock:
+            self._n += 1
+
+    def decrement(self):
+        with self._lock:
+            self._n -= 1
+
+    def value(self):
+        with self._lock:
+            return self._n
+
+
+INFLIGHT = _Counter()
+
+
+def inflight_count():
+    return INFLIGHT.value()
 
 
 def cwd_lock(cwd, rec):
@@ -419,6 +449,120 @@ def answer_cb(cb_id, text=None):
         pass
 
 
+# --- live streaming ---------------------------------------------------------
+# While a turn streams, ONE Telegram message is edited in place as a "working"
+# view (plain text, throttled). On success the progress message collapses to a
+# short trace and the full answer is sent as a NEW message — an edit never
+# fires a Telegram notification, only a new message does, so the owner is
+# pinged exactly once, on the final result.
+MIN_INTERVAL = 1.4      # min seconds between progress edits
+WINDOW = 3500           # tail of streamed text kept in the progress view
+
+
+class LiveStream:
+    def __init__(self, chat_id):
+        self.chat_id = chat_id
+        self.buf = []
+        self.status = ""
+        self.msg_id = None
+        self.last = 0.0
+        self.lock = threading.Lock()
+
+    def feed(self, text):
+        with self.lock:
+            self.buf.append(text)
+        self.tick()
+
+    def set_status(self, s):
+        with self.lock:
+            self.status = s
+        self.tick(force=True)
+
+    def _text(self):
+        body = "".join(self.buf)
+        if len(body) > WINDOW:
+            body = "…" + body[-WINDOW:]
+        cue = self.status
+        if cue and body:
+            return "%s\n\n%s" % (cue, body)
+        return cue or body or "💬 trabalhando…"
+
+    def tick(self, force=False):
+        now = time.time()
+        with self.lock:
+            if not force and now - self.last < MIN_INTERVAL:
+                return
+            self.last = now
+            txt = self._text()
+            mid = self.msg_id
+        try:
+            if mid is None:
+                # First paint: silent (disable_notification) so only the final
+                # NEW message pings the owner.
+                r = tg("sendMessage", {"chat_id": self.chat_id, "text": txt,
+                                       "disable_notification": "true"})
+                self.msg_id = (r.get("result") or {}).get("message_id")
+            else:
+                tg("editMessageText", {"chat_id": self.chat_id,
+                                       "message_id": mid, "text": txt})
+        except Exception:
+            pass
+        persist_live(self)
+
+    def finish_new(self, body, footer, head="✅ pronto 👇"):
+        """Collapse the progress message to a trace and send the full answer as
+        a NEW (notifying) message."""
+        try:
+            if self.msg_id is not None:
+                tg("editMessageText", {"chat_id": self.chat_id,
+                                       "message_id": self.msg_id,
+                                       "text": head + ("\n" + footer if footer
+                                                       else "")})
+        except Exception:
+            pass
+        send(self.chat_id, (footer + "\n\n" if footer else "") + (body or ""))
+        clear_live(self)
+
+    def cap_in_place(self, banner):
+        """Cancel/timeout path: stamp the partial in place with a banner; no new
+        message (the owner is already looking)."""
+        try:
+            if self.msg_id is not None:
+                tg("editMessageText", {"chat_id": self.chat_id,
+                                       "message_id": self.msg_id,
+                                       "text": "%s\n\n%s" % (banner,
+                                                             self._text())})
+        except Exception:
+            pass
+        clear_live(self)
+
+
+def persist_live(live):
+    """Snapshot a streaming run (chat, msg id, partial text) into STATE so a
+    hard restart can recover it. Cleared on delivery."""
+    if live.msg_id is None:
+        return
+    try:
+        with STATE_LOCK:
+            STATE.setdefault("live_runs", {})[str(live.msg_id)] = {
+                "chat": live.chat_id, "msg_id": live.msg_id,
+                "text": live._text()}
+            save_state()
+    except Exception as e:
+        sys.stderr.write("persist_live error: %s\n" % e)
+
+
+def clear_live(live):
+    if live.msg_id is None:
+        return
+    try:
+        with STATE_LOCK:
+            STATE.get("live_runs", {}).pop(str(live.msg_id), None)
+            save_state()
+    except Exception:
+        pass
+
+
 def tg_download_file(file_id, dest_dir, name_hint=None):
     """Resolve a Telegram file_id and download its bytes into dest_dir.
     Returns the absolute local path, or None on failure. Bot API caps
@@ -521,7 +665,8 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
             "--model", STATE.get("model", MODEL),
             "--effort", STATE.get("effort", EFFORT),
             "--permission-mode", "bypassPermissions",
-            "--output-format", "stream-json", "--verbose"]
+            "--output-format", "stream-json", "--verbose",
+            "--include-partial-messages"]
     if sid:
         args += ["--resume", sid]
 
@@ -568,16 +713,11 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
                        "/root/.local/bin:/usr/local/sbin:/usr/local/bin:"
                        "/usr/sbin:/usr/bin:/sbin:/bin")
 
-    stop = threading.Event()
-
-    def keepalive():
-        while not stop.is_set():
-            typing(chat_id)
-            stop.wait(4)
-
-    threading.Thread(target=keepalive, daemon=True).start()
+    live = rec.get("live") or LiveStream(chat_id)
+    rec["live"] = live  # so cancel/timeout can stamp the partial in place
 
     tools, result_text, new_sid, is_error, err = rec["tools"], None, None, False, ""
+    duration_ms = None
     try:
         proc = subprocess.Popen(args, cwd=cwd, env=env,
                                 stdin=subprocess.DEVNULL,
@@ -589,7 +729,7 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
         rec["proc"] = proc  # so /cc can kill this run
 
         def reader():
-            nonlocal result_text, new_sid, is_error
+            nonlocal result_text, new_sid, is_error, duration_ms
             for line in proc.stdout:
                 line = line.strip()
                 if not line:
@@ -601,6 +741,25 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
                 et = ev.get("type")
                 if et == "system" and ev.get("session_id"):
                     new_sid = ev["session_id"]
+                elif et == "stream_event":
+                    # Partial deltas: stream visible text, show a transient cue
+                    # for thinking / tool use. Ignore thinking/signature/json
+                    # deltas (not user-facing prose).
+                    se = ev.get("event") or {}
+                    st = se.get("type")
+                    if st == "content_block_start":
+                        blk = se.get("content_block") or {}
+                        bt = blk.get("type")
+                        if bt == "tool_use":
+                            live.set_status("⚙️ %s…" % blk.get("name", "tool"))
+                        elif bt == "thinking":
+                            live.set_status("🧠 pensando…")
+                        elif bt == "text":
+                            live.set_status("")
+                    elif st == "content_block_delta":
+                        d = se.get("delta") or {}
+                        if d.get("type") == "text_delta":
+                            live.feed(d.get("text", ""))
                 elif et == "assistant":
                     for blk in ev.get("message", {}).get("content", []):
                         if isinstance(blk, dict) and blk.get("type") == "tool_use":
@@ -610,6 +769,7 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
                         new_sid = ev["session_id"]
                     is_error = bool(ev.get("is_error"))
                     result_text = ev.get("result")
+                    duration_ms = ev.get("duration_ms")
 
         rt = threading.Thread(target=reader, daemon=True)
         rt.start()
@@ -617,29 +777,31 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
             proc.wait(timeout=CLAUDE_TIMEOUT)
         except subprocess.TimeoutExpired:
             proc.kill()
-            stop.set()
             _log_turn(cwd, "timeout", rec, tools)
-            return tools, "⏱️ timeout: ação passou de %ds e foi abortada." % CLAUDE_TIMEOUT
+            live.cap_in_place("⏱️ timeout (%ds)" % CLAUDE_TIMEOUT)
+            return tools, None
         rt.join(timeout=10)
         try:
             err = proc.stderr.read() or ""
         except Exception:
             err = ""
     finally:
-        stop.set()
         if mcp_cfg_path:
             try:
                 os.remove(mcp_cfg_path)
             except OSError:
                 pass
 
-    # Killed by /cc -> cancel_report already messaged; hand back a sentinel so
-    # handle() stays quiet instead of sending a "sem resultado" notice.
+    # Killed by /cc -> stamp the partial in place (the owner is already looking;
+    # no new notifying message). run_claude owns all delivery, so hand back the
+    # None sentinel.
     if rec.get("cancelled"):
         _log_turn(cwd, "cancelled", rec, tools)
+        elapsed = int(time.time() - rec.get("t_start", time.time()))
+        live.cap_in_place("🛑 cancelado (%ds)" % elapsed)
         return tools, None
 
-    # Stale session id -> drop it and retry once from scratch.
+    # Stale session id -> drop it and retry once from scratch (same LiveStream).
     if is_error and sid and not _retry and "session" in (result_text or "").lower():
         with STATE_LOCK:
             STATE["sessions"].pop(cwd, None)
@@ -656,9 +818,17 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
         msg = "⚠️ sem resultado do claude."
         if err:
             msg += "\n" + err[-1500:]
-        return tools, msg
+        live.cap_in_place("⚠️ sem resultado")
+        return tools, msg if not live.msg_id else None
     _log_turn(cwd, "error" if is_error else "ok", rec, tools)
-    return tools, result_text
+    secs = (duration_ms / 1000.0) if duration_ms else (time.time()
+                                                       - rec.get("t_start",
+                                                                 time.time()))
+    footer = "⏱️ %.0fs" % secs
+    if tools:
+        footer += " · 🔧 " + _tools_summary(tools)
+    live.finish_new(result_text, footer)
+    return tools, None
 
 
 def _log_turn(cwd, outcome, rec, tools):
@@ -975,8 +1145,10 @@ def _tools_summary(tools):
     return ", ".join("%s×%d" % (k, v) if v > 1 else k for k, v in c.items())
 
 
-def cancel_report(chat_id, cwd, rec):
-    """Kill an in-flight run and report how far it got (tools used, elapsed)."""
+def cancel_report(cwd, rec):
+    """Flag a run as cancelled and kill its subprocess. The run's own thread
+    then stamps the partial in place (LiveStream.cap_in_place) — we don't send
+    a message here, since run_claude owns all delivery."""
     rec["cancelled"] = True
     proc = rec.get("proc")
     if proc:
@@ -984,9 +1156,6 @@ def cancel_report(chat_id, cwd, rec):
             proc.kill()
         except Exception:
             pass
-    elapsed = fmt_uptime(time.time() - rec.get("t_start", time.time()))
-    send(chat_id, "🛑 cancelado em %s\n🔧 %s\n📁 %s"
-         % (elapsed, _tools_summary(rec.get("tools")), cwd))
 
 
 def cancel_active(chat_id):
@@ -996,7 +1165,7 @@ def cancel_active(chat_id):
     if not recs:
         return send(chat_id, "✋ nada rodando agora.")
     for cwd, rec in recs:
-        cancel_report(chat_id, cwd, rec)
+        cancel_report(cwd, rec)
 
 
 def resolve_cwd(arg):
@@ -1291,16 +1460,16 @@ def handle(chat_id, text):
     if not cwd_lock(cwd, rec):
         return send(chat_id, "⏳ já tem uma ação rodando nesse projeto — /cc "
                     "pra cancelar.")
+    INFLIGHT.increment()
     try:
-        tools, out = run_claude(chat_id, cwd, text, rec=rec)
+        # run_claude owns delivery (streams live, sends the final answer as a
+        # new message). It returns non-None text only on a rare fallback.
+        _tools, out = run_claude(chat_id, cwd, text, rec=rec)
     finally:
         cwd_unlock(cwd)
-    if rec.get("cancelled"):
-        return  # cancel_report already messaged
-    prefix = ""
-    if tools:
-        prefix = "🔧 " + _tools_summary(tools) + "\n\n"
-    send(chat_id, prefix + (out or ""))
+        INFLIGHT.decrement()
+    if out is not None:
+        send(chat_id, out)
 
 
 # ----------------------------------------------------------- dispatch ----

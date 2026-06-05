@@ -45,6 +45,12 @@ You accept this risk by running it.
   any of them (`/resume`), with pagination.
 - **Project hopping** — `/ls` to list projects, `/cd` to switch (each keeps its
   own session).
+- **Live streaming** — while a turn runs, one message is edited in place as a
+  throttled "working…" view (streamed text + a 🧠 thinking / ⚙️ tool cue). On
+  completion it collapses to a `✅ pronto` trace (`⏱️ Ns · 🔧 …`) and the full
+  answer is sent as a **new** message — an edit never notifies, only a new
+  message does, so the owner is pinged exactly once, on the final result.
+  Cancel/timeout stamp the partial in place (no extra ping).
 - **Mobile-friendly output** — Claude's markdown is converted to Telegram HTML
   (bold, italic, strikethrough, inline `code`, fenced blocks, links, headings,
   bullets, and `>` blockquotes — long quotes collapse to tap-to-expand).
