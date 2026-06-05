@@ -405,6 +405,24 @@ def typing(chat_id):
         pass
 
 
+CLEAR_WINDOW = 100  # how many recent messages /new tries to delete
+
+
+def clear_chat(chat_id, upto_msg_id):
+    """Best-effort 'clear the chat': delete a window of recent messages ending
+    at upto_msg_id. The Bot API has no bulk delete, so we walk ids downward and
+    swallow failures (a bot can delete its own messages anytime and the owner's
+    within 48h; older/undeletable ones just no-op)."""
+    if not upto_msg_id:
+        return
+    for mid in range(int(upto_msg_id), max(0, int(upto_msg_id) - CLEAR_WINDOW),
+                      -1):
+        try:
+            tg("deleteMessage", {"chat_id": chat_id, "message_id": mid})
+        except Exception:
+            pass
+
+
 # --- inline keyboards -------------------------------------------------------
 # A keyboard is a list of rows; each row a list of (label, callback_data).
 def _ikb(rows):
@@ -1048,7 +1066,10 @@ def handle_callback(cb):
         return edit_kb(chat_id, mid, "↩️ sessão → %s\n📁 %s\n"
                        "a próxima mensagem continua essa conversa."
                        % (sid[:8], STATE["cwd"]), session_choice_kb(STATE["cwd"]))
-    elif data in ("status", "new", "resume"):
+    elif data == "new":  # reset to home + clear chat (pass the menu msg id)
+        answer_cb(cb_id)
+        return handle(chat_id, "/new", msg_id=mid)
+    elif data in ("status", "resume"):
         answer_cb(cb_id)
         return handle(chat_id, "/" + data)
     answer_cb(cb_id)
@@ -1316,7 +1337,7 @@ def session_choice_kb(cwd):
     return rows
 
 
-def handle(chat_id, text):
+def handle(chat_id, text, msg_id=None):
     t = text.strip()
     if t.startswith("/"):
         parts = t.split(maxsplit=1)
@@ -1357,10 +1378,16 @@ def handle(chat_id, text):
             has = "sessão existente" if path in STATE["sessions"] else "sessão nova"
             return send(chat_id, "📁 cwd → %s (%s)" % (path, has))
         if cmd == "/new":
+            # Land back home with a fresh session and a clean chat. Only the
+            # home session is dropped — other projects' sessions are untouched.
+            clear_chat(chat_id, msg_id)
             with STATE_LOCK:
-                STATE["sessions"].pop(STATE["cwd"], None)
+                STATE["cwd"] = DEFAULT_CWD
+                STATE["ls_base"] = DEFAULT_CWD
+                STATE["sessions"].pop(DEFAULT_CWD, None)
                 save_state()
-            return send(chat_id, "🆕 sessão reiniciada em %s" % STATE["cwd"])
+            return send(chat_id, "🆕 de volta em casa (%s) com sessão nova."
+                        % DEFAULT_CWD)
         if cmd == "/resume":
             arg = arg.strip()
             low = arg.lower()
@@ -1549,7 +1576,7 @@ def process_message(msg):
         return send(chat_id, "(só texto, imagem, áudio e documentos são "
                     "suportados)")
     try:
-        handle(chat_id, text)
+        handle(chat_id, text, msg_id=msg.get("message_id"))
     except Exception as e:
         send(chat_id, "💥 erro no bridge: %s" % e)
         sys.stderr.write("handle error: %s\n" % e)

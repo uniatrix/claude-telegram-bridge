@@ -214,7 +214,7 @@ Homebrew so the agent can still find tools like `pdftoppm`.
 | `/cd <name\|/abs/path>` | Switch project (relative names resolve under `DEFAULT_CWD`); each project keeps its own session |
 | `/pwd` | Show the current directory, model and session id |
 | `/ls` | Browse project folders under `DEFAULT_CWD` as tappable buttons (paginated, 8/page). Tap a project to enter it; if it has past sessions you pick one (🆕 new or a recent session), otherwise it just enters. Folders named in `GROUP_DIRS` are 🗂️ groups that open into their own subfolders instead of becoming the cwd |
-| `/new` | Start a fresh session in the current directory |
+| `/new` | Land back **home** (`DEFAULT_CWD`) with a fresh session and clear the recent chat. Only the home session is dropped — other projects' sessions are untouched |
 | `/resume` | List this project's past sessions (paginated, newest first) |
 | `/resume <n>` | Resume session number `n` from the list |
 | `/resume mais` / `/resume menos` | Next / previous page of sessions |
