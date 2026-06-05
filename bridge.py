@@ -936,19 +936,19 @@ HELP = (
 # Slash-command menu registered with Telegram once at startup (the ≡ button and
 # the "/" autocomplete). Keep in sync with HELP and the handlers below.
 BOT_COMMANDS = [
-    ("cd", "troca o diretório (e a sessão)"),
-    ("pwd", "diretório/sessão atual"),
-    ("ls", "lista projetos em DEFAULT_CWD"),
-    ("new", "sessão nova no dir atual"),
-    ("resume", "lista/retoma sessões"),
-    ("model", "troca o modelo (opus|sonnet|haiku)"),
-    ("effort", "esforço (low|medium|high|xhigh|max)"),
-    ("status", "uptime, dir, modelo, esforço, MCP"),
-    ("menu", "menu de botões"),
-    ("btw", "lookup rápido efêmero (sessão à parte)"),
-    ("cc", "cancela a ação em andamento"),
-    ("mcp", "liga/desliga MCP servers"),
-    ("help", "esta ajuda"),
+    ("menu", "🎛️ Menu interativo (botões)"),
+    ("btw", "💡 Pesquisa rápida (sem pausar)"),
+    ("cc", "🛑 Cancela e mostra até onde rodou"),
+    ("status", "📊 Estado: dir, modelo, effort, sessão"),
+    ("model", "🧠 Troca o modelo (Opus/Sonnet/Haiku)"),
+    ("effort", "🎚️ Nível de raciocínio (low→max)"),
+    ("mcp", "🔌 Liga/desliga os MCP servers"),
+    ("ls", "📁 Lista projetos"),
+    ("cd", "📂 Troca de diretório/projeto"),
+    ("new", "🆕 Sessão nova + volta pra Documents"),
+    ("resume", "🔄 Lista/retoma sessões"),
+    ("pwd", "📍 Diretório/sessão atual"),
+    ("help", "❓ Ajuda e lista de comandos"),
 ]
 
 
