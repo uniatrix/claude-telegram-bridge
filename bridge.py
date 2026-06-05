@@ -129,6 +129,12 @@ TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp")
 # appended to the "Bridge reiniciado" message exactly once. Absent on a plain
 # (crash / logon) restart, which then just announces the reboot.
 RESTART_NOTE = os.path.join(TMP_DIR, "restart_note.txt")
+# The note is renamed to this once the graceful restart actually fires, so a
+# failed delete can't leave RESTART_NOTE behind and re-arm the watcher into a
+# reboot loop. Read + removed (along with any RESTART_NOTE) on next startup.
+RESTART_PENDING = os.path.join(TMP_DIR, "restart_pending.txt")
+RESTART_DRAIN_TIMEOUT = 120  # max seconds to let in-flight runs finish before exec
+RESTARTING = threading.Event()  # set while draining -> new prompts are deferred
 
 
 # ----------------------------------------------------------------- state ----
@@ -1480,6 +1486,8 @@ def handle(chat_id, text, msg_id=None):
                            sid or "(nova)", mcp_servers()))
         # unknown slash command -> fall through and treat as a prompt
 
+    if RESTARTING.is_set():
+        return send(chat_id, "🔄 reiniciando — manda de novo daqui a pouco.")
     cwd = STATE["cwd"]
     rec = {"tools": [], "t_start": time.time(), "proc": None, "cancelled": False}
     # Non-blocking project lock: if a run is already active in this cwd, refuse
@@ -1582,6 +1590,64 @@ def process_message(msg):
         sys.stderr.write("handle error: %s\n" % e)
 
 
+# ----------------------------------------------------------- restart ----
+def _finalize_orphans():
+    """Crash-recovery net. If a hard restart interrupted a streaming run before
+    its finish_new(), the snapshot (chat, msg id, partial text) survives in
+    STATE["live_runs"]. Collapse the frozen progress message and re-send the
+    captured text as a NEW (notifying) message flagged as recovered."""
+    runs = list(STATE.get("live_runs", {}).values())
+    if not runs:
+        return
+    for r in runs:
+        chat, mid, txt = r.get("chat"), r.get("msg_id"), r.get("text") or ""
+        try:
+            if mid:
+                tg("editMessageText", {"chat_id": chat, "message_id": mid,
+                                       "text": "♻️ recuperado após reinício 👇"})
+        except Exception:
+            pass
+        try:
+            send(chat, "♻️ *recuperado após reinício*\n\n" + txt)
+        except Exception:
+            pass
+    with STATE_LOCK:
+        STATE["live_runs"] = {}
+        save_state()
+
+
+def _do_graceful_restart():
+    """Drain in-flight runs (so each still delivers its final message), arm the
+    RESTART_PENDING marker, then re-exec in the SAME process (os.execv) — no
+    launchd/scheduler respawn throttle, and unlike a hard kickstart -k it never
+    kills the child claude mid-response."""
+    sys.stderr.write("graceful restart: draining %d run(s)\n" % inflight_count())
+    deadline = time.time() + RESTART_DRAIN_TIMEOUT
+    while inflight_count() > 0 and time.time() < deadline:
+        time.sleep(0.5)
+    try:
+        if os.path.exists(RESTART_NOTE):
+            os.replace(RESTART_NOTE, RESTART_PENDING)
+    except Exception as e:
+        sys.stderr.write("restart rename error: %s\n" % e)
+    sys.stderr.flush()
+    try:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        sys.stderr.write("execv error: %s\n" % e)
+        os._exit(1)
+
+
+def _restart_watcher():
+    """Daemon: when RESTART_NOTE appears (written deliberately after a change
+    that needs a reload), set RESTARTING and fire the graceful restart."""
+    while True:
+        time.sleep(2)
+        if not RESTARTING.is_set() and os.path.exists(RESTART_NOTE):
+            RESTARTING.set()
+            _do_graceful_restart()
+
+
 # ------------------------------------------------------------------ main ----
 def main():
     # OAUTH is optional: on Windows (and where ~/.claude/.credentials.json
@@ -1591,21 +1657,28 @@ def main():
         sys.stderr.write("missing TELEGRAM_BOT_TOKEN / OWNER_ID in %s\n"
                          % ENV_PATH)
         sys.exit(1)
+    # A reboot always lands home, never inside the last open project.
+    with STATE_LOCK:
+        STATE["cwd"] = DEFAULT_CWD
+        save_state()
     sys.stderr.write("bridge up. owner=%d model=%s cwd=%s\n"
                      % (OWNER_ID, STATE.get("model"), STATE["cwd"]))
     set_commands()  # register the ≡ menu / "/" autocomplete once
-    # Announce every startup to the owner so no reboot (mine, a crash-restart
-    # or a logon launch) ever passes silently — even one that killed the
-    # session before a reply could be sent. If a restart note was left behind
-    # (a deliberate restart after some task), append it once, then clear it.
+    # Read the restart note from RESTART_PENDING (graceful restart) or
+    # RESTART_NOTE (a hard restart that beat the watcher) and remove BOTH — a
+    # leftover RESTART_NOTE would immediately re-arm the watcher into a loop.
     note = ""
-    try:
-        if os.path.exists(RESTART_NOTE):
-            with open(RESTART_NOTE, "r", encoding="utf-8", errors="replace") as fh:
-                note = fh.read().strip()
-            os.remove(RESTART_NOTE)
-    except Exception as e:
-        sys.stderr.write("restart note error: %s\n" % e)
+    for marker in (RESTART_PENDING, RESTART_NOTE):
+        try:
+            if os.path.exists(marker):
+                with open(marker, "r", encoding="utf-8",
+                          errors="replace") as fh:
+                    note = note or fh.read().strip()
+                os.remove(marker)
+        except Exception as e:
+            sys.stderr.write("restart note error: %s\n" % e)
+    # Re-deliver any streaming run a hard restart interrupted, then announce.
+    _finalize_orphans()
     msg = ("♻️ *Bridge reiniciado* — no ar de novo.\n🧠 %s · 📁 %s"
            % (STATE.get("model"), STATE["cwd"]))
     if note:
@@ -1614,6 +1687,7 @@ def main():
         send(OWNER_ID, msg)
     except Exception as e:
         sys.stderr.write("startup notify error: %s\n" % e)
+    threading.Thread(target=_restart_watcher, daemon=True).start()
     while True:
         try:
             resp = tg("getUpdates",

@@ -52,13 +52,27 @@ sessions. Runs unchanged on Windows, Linux and WSL (branches on `os.name`).
 - `handle` — command router (`/cd /pwd /ls /new /resume /model /help`); unknown
   slash commands fall through and are treated as prompts.
 - `main` — poll loop with the **owner gate** (`OWNER_ID`) enforced before any
-  `claude` call. On startup it sends the owner a "Bridge reiniciado" message so
-  no reboot (manual, crash-restart or logon launch) ever passes silently. If a
-  `RESTART_NOTE` file (`tmp/restart_note.txt`) is present, its text — the task
-  that triggered the restart — is appended once, then the file is deleted; a
-  plain restart has no note and just announces the reboot. **Workflow: before a
-  deliberate restart after some change, write that note file describing what
-  was done.**
+  `claude` call. Each message and each callback tap runs on its own daemon
+  thread (`process_message` / `_run_callback`) so a long turn never blocks the
+  poll loop. On startup it resets `cwd` to home (`DEFAULT_CWD`), re-delivers any
+  interrupted streaming run (`_finalize_orphans`), and sends the owner a
+  "Bridge reiniciado" message so no reboot ever passes silently. If a restart
+  note (`tmp/restart_note.txt`, or `restart_pending.txt` after a graceful
+  restart) is present, its text is appended once and both markers are removed.
+- **Restart workflow (`_restart_watcher` / `os.execv`).** To reload code after
+  a change, **write `tmp/restart_note.txt` describing what changed and stop — do
+  NOT run `launchctl kickstart` / kill the process yourself.** A daemon watcher
+  sees the note, sets `RESTARTING` (new prompts are deferred), drains in-flight
+  runs (`inflight_count()` → 0, capped at `RESTART_DRAIN_TIMEOUT`) so each still
+  delivers its final message, renames the note to `restart_pending.txt`, and
+  re-execs in the same PID via `os.execv`. This replaces a hard kickstart that
+  would kill the child `claude` mid-response and drop the final message.
+- **Live streaming (`LiveStream`).** A turn edits one message in place as a
+  throttled "working" view; on completion it collapses to a `✅` trace and sends
+  the full answer as a **new** message (edits don't notify, new messages do).
+  `run_claude` owns delivery and returns `(tools, None)` on success. While a run
+  streams, `persist_live` snapshots it into `STATE["live_runs"]` for crash
+  recovery; `clear_live` removes the snapshot on delivery.
 
 ## Invariants / gotchas (do not regress)
 
@@ -82,7 +96,8 @@ python -m py_compile bridge.py
 python -c "import sys; sys.path.insert(0,'.'); import bridge; print(len(bridge.list_sessions(bridge.STATE['cwd'], limit=None)))"
 ```
 
-Reloading code requires restarting the process. If you restart from within a
-session driven by the bridge itself, launch the restart detached (so it
-survives the parent being killed) and add a few seconds of delay so the
-triggering reply is delivered first.
+Reloading code requires restarting the process. **Do not kill or kickstart the
+bridge yourself** — write `tmp/restart_note.txt` describing what changed and
+stop. The `_restart_watcher` daemon drains in-flight runs and re-execs the
+process gracefully (`os.execv`), so the triggering reply is delivered first and
+the child `claude` is never killed mid-response.
