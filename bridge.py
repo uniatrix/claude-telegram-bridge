@@ -127,7 +127,10 @@ RESTART_NOTE = os.path.join(TMP_DIR, "restart_note.txt")
 
 # ----------------------------------------------------------------- state ----
 # STATE = {"offset": int, "cwd": str, "model": str, "sessions": {cwd: sid}}
-STATE_LOCK = threading.Lock()
+# Re-entrant: a mutation site holds the lock and calls save_state(), which
+# re-acquires it. All size-changing mutations (sessions, resume_page) and
+# save_state hold this so a worker thread can't resize STATE mid-serialize.
+STATE_LOCK = threading.RLock()
 
 
 def load_state():
@@ -178,10 +181,40 @@ def cwd_unlock(cwd):
 
 def save_state():
     with STATE_LOCK:
+        # Serialize under the lock (snapshot to a string) so a concurrent
+        # mutation can't resize a dict mid-dump.
+        data = json.dumps(STATE)
         tmp = STATE_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(STATE, fh)
+            fh.write(data)
         os.replace(tmp, STATE_PATH)
+
+
+# ------------------------------------------------------------- turn log ----
+# One JSON record per turn (outcome ok/error/timeout/cancelled/no_result),
+# appended to turns.log and rotated at ~2 MB. Gitignored.
+TURNS_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "turns.log")
+TURNS_LOG_MAX = 2_000_000
+LOG_LOCK = threading.Lock()
+
+
+def log_event(kind, **fields):
+    """Append a timestamped record to turns.log. Never raises."""
+    try:
+        rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind}
+        rec.update(fields)
+        line = json.dumps(rec, ensure_ascii=False)
+        with LOG_LOCK:
+            try:
+                if os.path.getsize(TURNS_LOG) > TURNS_LOG_MAX:
+                    os.replace(TURNS_LOG, TURNS_LOG + ".1")
+            except OSError:
+                pass  # file absent yet -> nothing to rotate
+            with open(TURNS_LOG, "a", encoding="utf-8", errors="replace") as fh:
+                fh.write(line + "\n")
+    except Exception as e:
+        sys.stderr.write("log_event error: %s\n" % e)
 
 
 # -------------------------------------------------------------- telegram ----
@@ -552,6 +585,7 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
         except subprocess.TimeoutExpired:
             proc.kill()
             stop.set()
+            _log_turn(cwd, "timeout", rec, tools)
             return tools, "⏱️ timeout: ação passou de %ds e foi abortada." % CLAUDE_TIMEOUT
         rt.join(timeout=10)
         try:
@@ -564,24 +598,36 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
     # Killed by /cc -> cancel_report already messaged; hand back a sentinel so
     # handle() stays quiet instead of sending a "sem resultado" notice.
     if rec.get("cancelled"):
+        _log_turn(cwd, "cancelled", rec, tools)
         return tools, None
 
     # Stale session id -> drop it and retry once from scratch.
     if is_error and sid and not _retry and "session" in (result_text or "").lower():
-        STATE["sessions"].pop(cwd, None)
-        save_state()
+        with STATE_LOCK:
+            STATE["sessions"].pop(cwd, None)
+            save_state()
         return run_claude(chat_id, cwd, prompt, _retry=True, rec=rec)
 
     if new_sid:
-        STATE["sessions"][cwd] = new_sid
-        save_state()
+        with STATE_LOCK:
+            STATE["sessions"][cwd] = new_sid
+            save_state()
 
     if result_text is None:
+        _log_turn(cwd, "no_result", rec, tools)
         msg = "⚠️ sem resultado do claude."
         if err:
             msg += "\n" + err[-1500:]
         return tools, msg
+    _log_turn(cwd, "error" if is_error else "ok", rec, tools)
     return tools, result_text
+
+
+def _log_turn(cwd, outcome, rec, tools):
+    log_event("turn", cwd=cwd, outcome=outcome,
+              model=STATE.get("model"), effort=STATE.get("effort"),
+              tools=_tools_summary(tools),
+              dur=round(time.time() - rec.get("t_start", time.time()), 1))
 
 
 def run_quick(chat_id, prompt):
@@ -938,8 +984,9 @@ def handle(chat_id, text):
             has = "sessão existente" if path in STATE["sessions"] else "sessão nova"
             return send(chat_id, "📁 cwd → %s (%s)" % (path, has))
         if cmd == "/new":
-            STATE["sessions"].pop(STATE["cwd"], None)
-            save_state()
+            with STATE_LOCK:
+                STATE["sessions"].pop(STATE["cwd"], None)
+                save_state()
             return send(chat_id, "🆕 sessão reiniciada em %s" % STATE["cwd"])
         if cmd == "/resume":
             arg = arg.strip()
@@ -960,8 +1007,9 @@ def handle(chat_id, text):
                     p = min(p + 1, pages - 1)
                 else:
                     p = max(p - 1, 0)
-                STATE.setdefault("resume_page", {})[STATE["cwd"]] = p
-                save_state()
+                with STATE_LOCK:
+                    STATE.setdefault("resume_page", {})[STATE["cwd"]] = p
+                    save_state()
                 start = p * RESUME_PAGE
                 chunk = sessions[start:start + RESUME_PAGE]
                 blocks = []
@@ -994,8 +1042,9 @@ def handle(chat_id, text):
             if not match:
                 return send(chat_id, "❌ não achei a sessão: %s\n"
                             "use /resume pra ver a lista." % arg)
-            STATE["sessions"][STATE["cwd"]] = match
-            save_state()
+            with STATE_LOCK:
+                STATE["sessions"][STATE["cwd"]] = match
+                save_state()
             return send(chat_id, "↩️ sessão → %s\n"
                         "a próxima mensagem continua essa conversa." % match)
         if cmd == "/model":

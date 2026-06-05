@@ -2,6 +2,7 @@
 bridge.env
 state.json
 *.log
+turns.log*
 
 # Scratch / downloads
 tmp/
