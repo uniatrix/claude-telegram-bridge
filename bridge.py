@@ -76,6 +76,19 @@ def load_env(path):
 ENV_PATH = os.environ.get("BRIDGE_ENV", DEF_ENV)
 CFG = load_env(ENV_PATH)
 
+
+def provider_command(args, env):
+    """Use central provider priority while preserving the native CLI for /mcp."""
+    router = CFG.get("AI_ROUTER_PATH")
+    if not router:
+        return args
+    env.update({k: v for k, v in CFG.items() if k.startswith("AI_ROUTER_")})
+    env["REAL_CLAUDE_BIN"] = CLAUDE_BIN
+    env["CODEX_BIN"] = CFG["CODEX_BIN"]
+    env["AI_ROUTER_PROFILE"] = "agent"
+    env["AI_ROUTER_TIMEOUT"] = str(CLAUDE_TIMEOUT)
+    return [sys.executable.replace("pythonw.exe", "python.exe"), router] + args[1:]
+
 TOKEN = CFG.get("TELEGRAM_BOT_TOKEN", "")
 OWNER_ID = int(CFG.get("OWNER_ID", "0") or "0")
 OAUTH = CFG.get("CLAUDE_CODE_OAUTH_TOKEN", "")
@@ -750,7 +763,7 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
     tools, result_text, new_sid, is_error, err = rec["tools"], None, None, False, ""
     duration_ms = None
     try:
-        proc = subprocess.Popen(args, cwd=cwd, env=env,
+        proc = subprocess.Popen(provider_command(args, env), cwd=cwd, env=env,
                                 stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
@@ -891,7 +904,7 @@ def run_quick(chat_id, prompt):
 
     result_text = None
     try:
-        proc = subprocess.Popen(args, cwd=STATE["cwd"], env=env,
+        proc = subprocess.Popen(provider_command(args, env), cwd=STATE["cwd"], env=env,
                                 stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
