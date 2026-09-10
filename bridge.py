@@ -87,7 +87,33 @@ def provider_command(args, env):
     env["CODEX_BIN"] = CFG["CODEX_BIN"]
     env["AI_ROUTER_PROFILE"] = "agent"
     env["AI_ROUTER_TIMEOUT"] = str(CLAUDE_TIMEOUT)
+    env["AI_ROUTER_IMAGE_ROOT"] = TMP_DIR
     return [sys.executable.replace("pythonw.exe", "python.exe"), router] + args[1:]
+
+
+_MODEL_CACHE = {'at': 0, 'models': []}
+
+def available_models():
+    models = ['opus', 'sonnet', 'haiku']
+    if not CFG.get('AI_ROUTER_PATH'):
+        return models
+    if time.monotonic() - _MODEL_CACHE['at'] > 300 or not _MODEL_CACHE['models']:
+        env = dict(os.environ)
+        command = provider_command([CLAUDE_BIN, '--models'], env)
+        env.pop('AI_ROUTER_PROFILE', None)
+        try:
+            result = subprocess.run(command, env=env, capture_output=True, text=True,
+                                    encoding='utf-8', timeout=60, creationflags=CREATE_NO_WINDOW)
+            if result.returncode == 0:
+                catalog = json.loads(result.stdout)
+                policy = catalog.get('routing', {})
+                enabled = [policy.get('primary'), policy.get('fallback')]
+                ids = [('claude/' + m['id'] if m['provider'] == 'claude' else m['id'])
+                       for m in catalog['data'] if m['provider'] in enabled]
+                _MODEL_CACHE.update(at=time.monotonic(), models=ids)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+    return ['auto'] + _MODEL_CACHE['models']
 
 TOKEN = CFG.get("TELEGRAM_BOT_TOKEN", "")
 OWNER_ID = int(CFG.get("OWNER_ID", "0") or "0")
@@ -720,10 +746,10 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
     # tokens out of the argv and is removed after the run.
     mcp_cfg_path = None
     disabled = STATE.get("mcp_disabled", [])
-    if disabled:
+    if disabled or CFG.get('AI_ROUTER_PATH'):
         servers = user_mcp_servers()
         active = {n: c for n, c in servers.items() if n not in disabled}
-        if servers:
+        if servers or CFG.get('AI_ROUTER_PATH'):
             try:
                 os.makedirs(TMP_DIR, exist_ok=True)
                 mcp_cfg_path = os.path.join(
@@ -785,6 +811,8 @@ def run_claude(chat_id, cwd, prompt, _retry=False, rec=None):
                 et = ev.get("type")
                 if et == "system" and ev.get("session_id"):
                     new_sid = ev["session_id"]
+                elif et == 'router':
+                    live.set_status('🧠 %s (%s)' % (ev.get('provider'), ev.get('model')))
                 elif et == "stream_event":
                     # Partial deltas: stream visible text, show a transient cue
                     # for thinking / tool use. Ignore thinking/signature/json
@@ -935,7 +963,7 @@ def run_quick(chat_id, prompt):
 
 # -------------------------------------------------------------- commands ----
 HELP = (
-    "Claude Code via Telegram (owner-only)\n"
+    "Agente Claude/Codex via Telegram (owner-only)\n"
     "Mande qualquer texto = prompt pro agente.\n\n"
     "/cd <proj|/caminho/abs> — troca o diretório (e a sessão)\n"
     "/pwd — mostra o diretório/sessão atual\n"
@@ -943,7 +971,7 @@ HELP = (
     "/new — começa uma sessão nova no dir atual\n"
     "/resume [nº|id] — lista sessões; /resume mais|menos pagina; "
     "retoma pelo nº/id\n"
-    "/model <opus|sonnet|haiku> — troca o modelo\n"
+    "/model <auto|modelo> : troca o modelo; auto segue a prioridade global\n"
     "/effort <low|medium|high|xhigh|max> — esforço de raciocínio\n"
     "/status — uptime, dir, modelo, esforço, MCP servers\n"
     "/menu — abre o menu de botões\n"
@@ -960,7 +988,7 @@ BOT_COMMANDS = [
     ("btw", "💡 Pesquisa rápida (sem pausar)"),
     ("cc", "🛑 Cancela e mostra até onde rodou"),
     ("status", "📊 Estado: dir, modelo, effort, sessão"),
-    ("model", "🧠 Troca o modelo (Opus/Sonnet/Haiku)"),
+    ("model", "🧠 Modelos disponíveis de Claude/Codex"),
     ("effort", "🎚️ Nível de raciocínio (low→max)"),
     ("mcp", "🔌 Liga/desliga os MCP servers"),
     ("ls", "📁 Lista projetos"),
@@ -998,7 +1026,7 @@ def model_kb():
     keeps the lowercase id claude expects."""
     cur = STATE.get("model")
     rows = [[(("✅ " if m == cur else "") + m.capitalize(), "model:" + m)]
-            for m in ("opus", "sonnet", "haiku")]
+            for m in available_models()]
     rows.append([("‹ voltar", "menu:main")])
     return rows
 
@@ -1039,7 +1067,7 @@ def handle_callback(cb):
         edit_kb(chat_id, mid, "⚡ *Esforço*", effort_kb())
     elif data.startswith("model:"):
         sel = data.split(":", 1)[1]
-        if sel in ("opus", "sonnet", "haiku"):
+        if sel in available_models():
             STATE["model"] = sel
             save_state()
         answer_cb(cb_id, "modelo: %s" % sel)
@@ -1179,6 +1207,9 @@ def fmt_uptime(seconds):
 def mcp_servers():
     """Best-effort list of configured MCP server names via `claude mcp list`.
     Returns a short string; never raises. Empty/failed -> a friendly marker."""
+    if CFG.get('AI_ROUTER_PATH'):
+        disabled = STATE.get('mcp_disabled', [])
+        return ', '.join(n for n in user_mcp_servers() if n not in disabled) or '(nenhum)'
     try:
         env = dict(os.environ)
         if OAUTH:
@@ -1303,11 +1334,41 @@ def _dir_sessions(d, limit=None):
 
 def list_sessions(cwd, limit=SESS_LIST_LIMIT):
     """Recent sessions for cwd as [(sid, mtime, path)], newest first."""
-    return _dir_sessions(project_dir_for(cwd), limit)
+    items = _dir_sessions(project_dir_for(cwd))
+    for sid, value, path in router_sessions():
+        if os.path.normcase(os.path.normpath(value['cwd'])) == os.path.normcase(os.path.normpath(cwd)):
+            items.append((sid, os.path.getmtime(path), path))
+    items.sort(key=lambda x: x[1], reverse=True)
+    return items if limit is None else items[:limit]
+
+
+def router_sessions():
+    root = CFG.get('AI_ROUTER_SESSIONS', os.path.expanduser('~/.codex-router-bridge/sessions'))
+    items = []
+    if os.path.isdir(root):
+        for name in os.listdir(root):
+            if not re.fullmatch(r'router-[a-f0-9]{32}\.json', name):
+                continue
+            path = os.path.join(root, name)
+            try:
+                with open(path, encoding='utf-8') as source:
+                    value = json.load(source)
+                if value.get('cwd'):
+                    items.append((name[:-5], value, path))
+            except (OSError, ValueError):
+                continue
+    return items
 
 
 def session_preview(path, maxlen=60):
     """First real user line of a transcript, for a human-readable list."""
+    if path.endswith('.json'):
+        try:
+            with open(path, encoding='utf-8') as source:
+                value = json.load(source)
+            return next((m['text'].replace('\n', ' ')[:maxlen] for m in value.get('history', []) if m['role'] == 'user'), '')
+        except (OSError, ValueError):
+            return ''
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for i, line in enumerate(fh):
@@ -1355,6 +1416,12 @@ def _projects_base():
 def session_cwd(path):
     """The real cwd a transcript ran in, read from its events (the slug dir name
     is lossy, the embedded cwd is authoritative). None if not found."""
+    if path.endswith('.json'):
+        try:
+            with open(path, encoding='utf-8') as source:
+                return json.load(source).get('cwd')
+        except (OSError, ValueError):
+            return None
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for i, line in enumerate(fh):
@@ -1374,6 +1441,9 @@ def session_cwd(path):
 
 def find_session_file(sid):
     """Locate <sid>.jsonl across every project dir -> (path, cwd) or None."""
+    for candidate, value, path in router_sessions():
+        if candidate == sid:
+            return path, value['cwd']
     base = _projects_base()
     try:
         slugs = os.listdir(base)
@@ -1410,7 +1480,15 @@ def session_projects(limit=24):
         if not sess:
             continue
         cwd = session_cwd(sess[0][2]) or slug
+        sess = list_sessions(cwd, limit=None)
         out.append((slug, cwd, sess[0][1], len(sess)))
+    for sid, value, path in router_sessions():
+        cwd = value['cwd']
+        if any(os.path.normcase(os.path.normpath(row[1])) == os.path.normcase(os.path.normpath(cwd)) for row in out):
+            continue
+        slug = os.path.basename(project_dir_for(cwd))
+        sessions = list_sessions(cwd, limit=None)
+        out.append((slug, cwd, sessions[0][1], len(sessions)))
     out.sort(key=lambda x: x[2], reverse=True)
     return out[:limit]
 
@@ -1468,6 +1546,11 @@ def project_sessions_kb(slug):
     d = os.path.join(_projects_base(), slug)
     sess = _dir_sessions(d)
     cwd = session_cwd(sess[0][2]) if sess else None
+    if not cwd:
+        cwd = next((value['cwd'] for _, value, _ in router_sessions()
+                    if os.path.basename(project_dir_for(value['cwd'])) == slug), None)
+    if cwd:
+        sess = list_sessions(cwd, limit=None)
     cur = STATE["cwd"]
     is_cur = bool(cwd) and (os.path.normcase(os.path.normpath(cwd))
                             == os.path.normcase(os.path.normpath(cur)))
@@ -1663,9 +1746,8 @@ def handle(chat_id, text, msg_id=None):
                         "a próxima mensagem continua essa conversa." % match)
         if cmd == "/model":
             m = arg.strip().lower()
-            if m not in ("opus", "sonnet", "haiku"):
-                return send(chat_id, "use: /model opus|sonnet|haiku (atual: %s)"
-                            % STATE.get("model"))
+            if m not in available_models():
+                return send(chat_id, 'use /model com: %s (atual: %s)' % (', '.join(available_models()), STATE.get('model')))
             STATE["model"] = m
             save_state()
             return send(chat_id, "🧠 modelo → %s" % m)
