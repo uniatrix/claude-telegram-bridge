@@ -103,7 +103,7 @@ def available_models():
         env.pop('AI_ROUTER_PROFILE', None)
         try:
             result = subprocess.run(command, env=env, capture_output=True, text=True,
-                                    encoding='utf-8', timeout=60, creationflags=CREATE_NO_WINDOW)
+                                    encoding='utf-8', errors='replace', timeout=60, creationflags=CREATE_NO_WINDOW)
             if result.returncode == 0:
                 catalog = json.loads(result.stdout)
                 policy = catalog.get('routing', {})
@@ -111,7 +111,7 @@ def available_models():
                 ids = [('claude/' + m['id'] if m['provider'] == 'claude' else m['id'])
                        for m in catalog['data'] if m['provider'] in enabled]
                 _MODEL_CACHE.update(at=time.monotonic(), models=ids)
-        except (OSError, ValueError, subprocess.TimeoutExpired):
+        except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
             pass
     return ['auto'] + _MODEL_CACHE['models']
 
